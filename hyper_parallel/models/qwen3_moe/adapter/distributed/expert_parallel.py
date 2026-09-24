@@ -23,6 +23,8 @@ dispatch/collective primitives stay in the generic
 them through the now-public ``build_ep_compute``.
 """
 
+from __future__ import annotations
+
 from typing import Any, Callable
 
 from hyper_parallel.distributed.expert_parallel.recipes import (
@@ -44,7 +46,7 @@ def qwen3moe_ep_compute_fn(
     tp_mesh: Any,
     cp_mesh: Any,
     ep_mesh: Any,
-    use_grouped_gemm: bool = False,
+    use_grouped_gemm: bool | None = None,
 ) -> Callable:
     """Archetype ``qwen3moe_topk_router``: TopKRouter module returning
     (logits, scores, indices), no shared expert (Qwen3-MoE).

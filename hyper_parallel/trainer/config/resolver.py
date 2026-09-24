@@ -38,6 +38,7 @@ from hyper_parallel.trainer.config.data import (
 )
 from hyper_parallel.trainer.config.optimization import OptimizerConfig
 from hyper_parallel.trainer.config.target import Target
+from hyper_parallel.trainer.config.replacement import ReplacementTarget
 from hyper_parallel.trainer.config.trainer import TrainerConfig
 
 
@@ -342,6 +343,10 @@ def _replace_target_path(
             f"CLI.{full_path}", "changing _target_ through an override is not supported"
         )
 
+    if isinstance(config, ReplacementTarget) and name in ("use_mxfp8", "use_fused_mxfp8"):
+        normalized = normalize_value(value, bool, path=f"CLI.{full_path}")
+        return config.replace(**{name: normalized})
+
     signature = inspect.signature(config.callable)
     parameter = signature.parameters.get(name)
     has_var_kwargs = any(
@@ -590,6 +595,23 @@ def _resolve_target(node: object, *, path: str) -> Target[Any]:
     )
 
 
+def _resolve_replacement_target(node: object, *, path: str) -> ReplacementTarget:
+    """Resolve replacement selectors separately from generic callable targets."""
+    if not isinstance(node, Mapping) or "_target_" not in node:
+        raise ConfigResolutionError(path, "replacement requires a mapping with _target_")
+    target_path = node["_target_"]
+    requested = import_target(target_path, location=f"{path}._target_")
+    try:
+        selected = ReplacementTarget(requested, target_path=target_path,
+                                     **{key: value for key, value in node.items() if key != "_target_"})
+        normalized = _resolve_target_args(
+            selected._kwargs, inspect.signature(selected.callable),
+            _target_hints(selected.callable, path=path), path=path)
+        return selected.replace(**normalized)
+    except (ValueError, TypeError, NotImplementedError) as exc:
+        raise ConfigResolutionError(path, str(exc)) from exc
+
+
 def _resolve_dataloader_config(node: object, *, path: str) -> DataLoaderConfig:
     """Resolve a ``DataLoaderConfig`` with its collator and batch adapter."""
     if not isinstance(node, Mapping):
@@ -698,6 +720,8 @@ def resolve_component(node: object, *, annotation: object, path: str) -> object:
 
     origin = get_origin(annotation)
     if origin is Target or annotation is Target:
+        if path.endswith(".replace_module"):
+            return _resolve_replacement_target(node, path=path)
         return _resolve_target(node, path=path)
     if annotation is DatasetConfig:
         return _resolve_dataset_config(node, path=path)

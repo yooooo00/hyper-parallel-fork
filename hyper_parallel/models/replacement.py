@@ -370,12 +370,13 @@ def _apply_module_replacement_actions(
         for axis in ("tp", "cp", "ep", "pp")
         if context.get(axis)
     ]
+    plan = compile_module_replacements(model, tuple(replacement_rules or ()))
     if context.get("low_precision") is not None and active_model_parallel_axes:
         raise NotImplementedError(
             "Low-precision online training currently requires TP=CP=EP=PP=1; "
-            f"active axes: {active_model_parallel_axes}."
+            f"active axes: {active_model_parallel_axes}; "
+            f"modules: {[target.module_fqns[0] for target in plan.targets] or ['<model>']}."
         )
-    plan = compile_module_replacements(model, tuple(replacement_rules or ()))
     return apply_module_replacements(
         model,
         plan,

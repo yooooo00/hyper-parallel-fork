@@ -30,12 +30,12 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 )
 
 from hyper_parallel.models.replacement import module_replacement
-from hyper_parallel.components.functional import (
-    grouped_matmul,
-    moe_token_permute,
-    moe_token_unpermute,
-    swiglu,
-)
+from hyper_parallel.components import functional as expert_ops
+
+
+def _swiglu(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Resolve optional device operators only when expert computation runs."""
+    return expert_ops.swiglu(x, dim=dim)  # pylint: disable=not-callable
 
 
 @module_replacement
@@ -136,7 +136,7 @@ class GroupedExperts(nn.Module):
         if not gated_linear_unit:
             return activation_func
         if hidden_act == "silu" and bool(getattr(config, "use_fused_swiglu", True)):
-            return partial(swiglu, dim=-1)
+            return partial(_swiglu, dim=-1)
 
         def glu(x: torch.Tensor) -> torch.Tensor:
             """Apply the configured gated linear unit."""
@@ -389,7 +389,7 @@ class GroupedExperts(nn.Module):
 
         # up
         if permuted.nelement() != 0:
-            fc1_output = grouped_matmul(  # pylint: disable=not-callable
+            fc1_output = expert_ops.grouped_matmul(  # pylint: disable=not-callable
                 permuted, gate_up_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
             if self.add_bias:
@@ -412,7 +412,7 @@ class GroupedExperts(nn.Module):
             down_proj = down_proj.view(self.num_local_experts, -1, self.hidden_size)
 
         if fc1_output.nelement() != 0:
-            fc2_output = grouped_matmul(  # pylint: disable=not-callable
+            fc2_output = expert_ops.grouped_matmul(  # pylint: disable=not-callable
                 fc1_output, down_proj, bias=None, group_list=self._group_list, group_type=0, group_list_type=0,
             )
             if self.add_bias:
@@ -459,7 +459,7 @@ class GroupedExperts(nn.Module):
         """Run grouped experts with the Transformers Experts interface."""
         hidden_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_states.shape[-1])
-        permuted_tokens, sorted_indices = moe_token_permute(  # pylint: disable=not-callable
+        permuted_tokens, sorted_indices = expert_ops.moe_token_permute(  # pylint: disable=not-callable
             hidden_states_flat,
             top_k_index,
         )
@@ -476,7 +476,7 @@ class GroupedExperts(nn.Module):
             tokens_per_expert,
             permuted_probs,
         )
-        output = moe_token_unpermute(  # pylint: disable=not-callable
+        output = expert_ops.moe_token_unpermute(  # pylint: disable=not-callable
             expert_outputs,
             sorted_indices,
             top_k_weights,

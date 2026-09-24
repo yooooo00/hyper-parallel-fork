@@ -156,8 +156,9 @@ def _capture_ep_primitives(monkeypatch):
         captured.update(router_fn=router_fn, ep_group=ep_group)
         return hidden_states
 
-    def fake_bind(module, ep_size):
-        captured.update(bound_module=module, ep_size=ep_size)
+    def fake_bind(module: nn.Module, ep_size: int, use_grouped_gemm: bool = None) -> None:
+        """Record the complete tri-state binding request."""
+        captured.update(bound_module=module, ep_size=ep_size, use_grouped_gemm=use_grouped_gemm)
 
     monkeypatch.setattr(ep_compute, "ep_routed_forward", fake_compute)
     monkeypatch.setattr(ep_compute, "bind_local_expert_forward", fake_bind)
