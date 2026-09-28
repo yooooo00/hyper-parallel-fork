@@ -22,6 +22,8 @@ Repeated backward and EP vs order-matched MXFP8 reference require exact equality
 import copy
 import json
 import os
+import time
+import statistics
 from typing import Any
 
 import pytest
@@ -31,6 +33,7 @@ from torch.nn import functional as F
 
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.components.quantization.functional.npu_mxfp8 import MXFP8NpuOps
+from hyper_parallel.components.quantization.tensor import QuantizedTensor
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.trainer.config import entries_to_plan_overrides
@@ -45,6 +48,8 @@ class CountingMXOps(MXFP8NpuOps):
         """Validate the backend and start a fresh operator-call record."""
         super().__init__(backend)
         self.calls = []
+        self.fused_forward = 0
+        self.fused_backward = 0
 
     def quant_grouped_matmul(self, x1: torch.Tensor, x2: torch.Tensor, x2_scale: torch.Tensor,
                             **kwargs: Any) -> torch.Tensor:
@@ -59,6 +64,23 @@ class CountingMXOps(MXFP8NpuOps):
         self.calls.append((str(x1.dtype), str(x2.dtype), kwargs["group_type"]))
         assert x1.dtype == torch.float8_e4m3fn and x2.dtype == torch.float8_e4m3fn
         return super().quant_grouped_matmul(x1, x2, x2_scale, **kwargs)
+
+
+    def swiglu_mx_quant_dual_axis(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, ...]:
+        """Count genuine fused forward calls."""
+        self.fused_forward += 1
+        return super().swiglu_mx_quant_dual_axis(*args, **kwargs)
+
+    def swiglu_backward_mx_quant_dual_axis(self, *args: Any, **kwargs: Any) -> tuple[torch.Tensor, ...]:
+        """Count genuine fused backward calls."""
+        self.fused_backward += 1
+        return super().swiglu_backward_mx_quant_dual_axis(*args, **kwargs)
+
+
+def _pack_physical(tensor):
+    """Reject saved carriers and exercise restoration from an independent allocation."""
+    assert not isinstance(tensor, QuantizedTensor)
+    return tensor.detach().clone()
 
 
 def _device():
@@ -126,14 +148,15 @@ def _check_local_case(expert, baseline, counts, frozen, device):
         assert all(torch.count_nonzero(grad) == 0 for grad in grads)
 
 
-def test_single_device():
+@pytest.mark.parametrize("fused", [False, True])
+def test_single_device(fused):
     """Fixed routing, output/dX/dW, empty/frozen/repeated backward and three updates."""
     device, backend = _device()
     torch.manual_seed(793)
     source = TinyMoE(dtype=torch.bfloat16).to(device)
     baseline, low = copy.deepcopy(source), copy.deepcopy(source)
     replace_experts(baseline, family_config())
-    replace_experts(low, family_config(use_mxfp8=True))
+    replace_experts(low, family_config(use_mxfp8=True, use_fused_mxfp8=fused))
     ops = CountingMXOps(backend)
     low.mlp.experts.quantizer._npu_ops = ops
     tokens = 40
@@ -176,12 +199,14 @@ def test_single_device():
         assert step_input.grad is not None and torch.isfinite(step_input.grad).all()
     assert all(not torch.equal(before, after) for before, after in zip(initial, expert.parameters()))
     assert any(call[2] == 2 for call in ops.calls)
+    if fused:
+        assert ops.fused_forward > 0 and ops.fused_backward > 0
     torch.npu.synchronize()
-    print(json.dumps({"single_device": "passed", "gmm_calls": len(ops.calls), "three_step_losses": losses}), flush=True)
+    print(json.dumps({"fused": fused, "fusion_calls": [ops.fused_forward, ops.fused_backward], "single_device": "passed", "gmm_calls": len(ops.calls), "three_step_losses": losses}), flush=True)
 
 
-def _ep_config():
-    config = family_config(use_mxfp8=True).to_dict()
+def _ep_config(fused=False):
+    config = family_config(use_mxfp8=True, use_fused_mxfp8=fused).to_dict()
     config["plan_overrides"].append({
         "match": "mlp", "when": "ep", "region_dispatch": False,
         "local_compute_fn": {"_target_":
@@ -255,8 +280,9 @@ def _check_ep_case(model, reference_experts, rank, device, hooks, empty_rank):
     actual_scores = scores[rank].detach().clone().requires_grad_()
     model.mlp.gate.indices, model.mlp.gate.scores = routes[rank], actual_scores
     model.zero_grad(set_to_none=True)
-    actual = model(actual_input)
-    (actual * upstream[rank]).sum().backward()
+    with torch.autograd.graph.saved_tensors_hooks(_pack_physical, lambda t: t):
+        actual = model(actual_input)
+        (actual * upstream[rank]).sum().backward()
     torch.testing.assert_close(actual, expected_outputs[rank], rtol=0, atol=0)
     torch.testing.assert_close(actual_input.grad, inputs[rank].grad, rtol=0, atol=0)
     torch.testing.assert_close(actual_scores.grad, scores[rank].grad, rtol=0, atol=0)
@@ -267,9 +293,14 @@ def _check_ep_case(model, reference_experts, rank, device, hooks, empty_rank):
         assert all(torch.count_nonzero(p.grad) == 0 for p in expert.parameters())
     print(json.dumps({"rank": rank, "empty_receiving_rank": empty_rank,
                       "local_tokens": hooks[-1][0], "parity": "exact"}), flush=True)
+    return {"output": actual.detach().clone(), "dx": actual_input.grad.detach().clone(),
+            "dscores": actual_scores.grad.detach().clone(),
+            **{name: weight.grad.detach().clone() for name, weight in expert.named_parameters()}}
 
 
-def test_ep_two():
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_ep_two(fused):
     """Real planner/apply + Qwen3 recipe; cross-rank routing and an empty receiving rank."""
     device, backend = _device()
     if int(os.environ.get("WORLD_SIZE", "1")) != 2:
@@ -279,7 +310,7 @@ def test_ep_two():
     try:
         torch.manual_seed(793)
         model = TinyMoE(dtype=torch.bfloat16).to(device)
-        config = _ep_config()
+        config = _ep_config(fused)
         replace_experts(model, config, context={"ep": True, "ep_size": 2})
         reference_experts = copy.deepcopy(model.mlp.experts)
         mesh = init_device_mesh("npu", (2, 1), mesh_dim_names=("dp", "tp"))
@@ -301,7 +332,144 @@ def test_ep_two():
             _check_ep_case(model, reference_experts, rank, device, hooks, empty_rank)
         handle.remove()
         assert len(hooks) == 2 and len(ops.calls) > 0
-        print(json.dumps({"rank": rank, "gmm_calls": len(ops.calls), "ep_two": "passed"}), flush=True)
+        assert not fused or (ops.fused_forward > 0 and ops.fused_backward > 0)
+        print(json.dumps({"fused": fused, "fusion_calls": [ops.fused_forward, ops.fused_backward], "rank": rank, "gmm_calls": len(ops.calls), "ep_two": "passed"}), flush=True)
         torch.npu.synchronize()
     finally:
         dist.destroy_process_group()
+
+
+def test_fused_comparison():
+    """Compare fused/unfused output and all gradients before timing identical work."""
+    device, backend = _device()
+    torch.manual_seed(862)
+    source = TinyMoE(dtype=torch.bfloat16).to(device)
+    models = [copy.deepcopy(source) for _ in range(2)]
+    for fused, model in zip((False, True), models):
+        replace_experts(model, family_config(use_mxfp8=True, use_fused_mxfp8=fused))
+        model.mlp.experts.quantizer._npu_ops = CountingMXOps(backend)
+    for counts in ([1, 0, 31, 33], [0, 0, 0, 0], [0, 32, 1, 31]):
+        groups = torch.tensor(counts, device=device, dtype=torch.int64)
+        x = torch.randn(sum(counts), 128, dtype=torch.bfloat16, device=device)
+        upstream = torch.randn_like(x)
+        results = []
+        for model in models:
+            expert = model.mlp.experts
+            inputs = x.detach().clone().requires_grad_()
+            # Saved-tensor hooks see physical tensors, including retained backward.
+            with torch.autograd.graph.saved_tensors_hooks(_pack_physical, lambda t: t):
+                output = expert.forward_expert_major(inputs, groups)
+                grads = torch.autograd.grad(output, (inputs, *expert.parameters()), upstream, retain_graph=True)
+                repeated = torch.autograd.grad(output, (inputs, *expert.parameters()), upstream)
+            for actual, again in zip(grads, repeated):
+                torch.testing.assert_close(actual, again, rtol=0, atol=0)
+            results.append((output, *grads))
+        for name, plain, fused in zip(("output", "dx", "dgate_up", "ddown"), *results):
+            _metric(f"fused_vs_unfused/{counts}/{name}", fused, plain)
+    groups = torch.tensor([256] * 4, device=device, dtype=torch.int64)
+    x = torch.randn(1024, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
+    for fused, model in zip((False, True), models):
+        expert = model.mlp.experts
+        times = []
+        for step in range(13):
+            expert.zero_grad(set_to_none=True)
+            x.grad = None
+            torch.npu.synchronize()
+            start = time.perf_counter()
+            expert.forward_expert_major(x, groups).float().square().mean().backward()
+            torch.npu.synchronize()
+            if step >= 3:
+                times.append((time.perf_counter() - start) * 1000)
+        ops = expert.quantizer.npu_ops
+        print(json.dumps({"fused": fused, "train_ms_median": statistics.median(times),
+                          "samples": len(times), "fusion_calls": [ops.fused_forward, ops.fused_backward]}), flush=True)
+
+
+def test_ep_fused_comparison():
+    """Compare two real planner-sharded EP models with identical routes and weights."""
+    device, backend = _device()
+    if int(os.environ.get("WORLD_SIZE", "1")) != 2:
+        pytest.skip("Run with torchrun --nproc-per-node=2")
+    dist.init_process_group("hccl")
+    rank = dist.get_rank()
+    try:
+        mesh = init_device_mesh("npu", (2, 1), mesh_dim_names=("dp", "tp"))
+        cases = []
+        for fused in (False, True):
+            torch.manual_seed(793)
+            model = TinyMoE(dtype=torch.bfloat16).to(device)
+            config = _ep_config(fused)
+            replace_experts(model, config, context={"ep": True, "ep_size": 2})
+            reference = copy.deepcopy(model.mlp.experts)
+            overrides = entries_to_plan_overrides(config.plan_overrides, ep_size=2)
+            plan = ShardingPlanner(plan_overrides=overrides).plan(model, mesh, ep_size=2, sequence_parallel=False)
+            model, _ = apply_sharding_plan(model, plan, mesh)
+            expert = model.mlp.experts
+            assert expert.gate_up_proj.shape == (2, 128, 512)
+            assert expert.down_proj.shape == (2, 256, 128)
+            ops, hooks = CountingMXOps(backend), []
+            expert.quantizer._npu_ops = ops
+            expert.register_forward_hook(
+                lambda module, args, output, records=hooks: records.append((args[0].shape[0], output.shape[0])))
+            cases.append((model, reference, ops, hooks))
+        for left, right in zip(cases[0][0].parameters(), cases[1][0].parameters()):
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
+        for empty_rank in (False, True):
+            results = [_check_ep_case(model, reference, rank, device, hooks, empty_rank)
+                       for model, reference, _, hooks in cases]
+            for name in results[0]:
+                _metric(f"EP2/rank={rank}/empty={empty_rank}/{name}", results[1][name], results[0][name])
+        for fused, (_, _, ops, hooks) in zip((False, True), cases):
+            assert len(hooks) == 2 and len(ops.calls) > 0
+            assert (ops.fused_forward > 0 and ops.fused_backward > 0) if fused else (
+                ops.fused_forward == 0 and ops.fused_backward == 0)
+            print(json.dumps({"ep_direct_comparison": "passed", "rank": rank, "fused": fused,
+                              "gmm_calls": len(ops.calls),
+                              "fusion_calls": [ops.fused_forward, ops.fused_backward]}), flush=True)
+        torch.npu.synchronize()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_three_way_loss():
+    """Compare BF16/unfused/fused loss trajectories from identical initial weights."""
+    device, backend = _device()
+    torch.manual_seed(793)
+    source = TinyMoE(dtype=torch.bfloat16).to(device)
+    names = ("bf16", "mxfp8", "fused_mxfp8")
+    models = [copy.deepcopy(source) for _ in names]
+    for index, model in enumerate(models):
+        replace_experts(model, family_config(use_mxfp8=index > 0, use_fused_mxfp8=index == 2))
+        if index:
+            model.mlp.experts.quantizer._npu_ops = CountingMXOps(backend)
+    x = torch.randn(1, 40, 128, dtype=torch.bfloat16).to(device)
+    indices = torch.tensor([[i % 4, (i + 1) % 4] for i in range(40)], device=device)
+    scores = torch.tensor([[.25, .75]] * 40, device=device, dtype=torch.bfloat16)
+    for model in models:
+        model.mlp.gate.indices, model.mlp.gate.scores = indices, scores
+        for ref, actual in zip(models[0].parameters(), model.parameters()):
+            torch.testing.assert_close(ref, actual, rtol=0, atol=0)
+    optimizers = [torch.optim.SGD(model.parameters(), lr=.1) for model in models]
+    trajectories = {name: [] for name in names}
+    for step in range(3):
+        outputs = []
+        for name, model, optimizer in zip(names, models, optimizers):
+            optimizer.zero_grad(set_to_none=True)
+            inputs = x.detach().clone().requires_grad_()
+            output = model(inputs)
+            loss = output.float().square().sum()
+            trajectories[name].append(loss.item())
+            outputs.append(output.detach())
+            loss.backward()
+            assert torch.isfinite(loss) and torch.isfinite(inputs.grad).all()
+            assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+            optimizer.step()
+        for index in (1, 2):
+            _metric(f"loss_step={step + 1}/{names[index]}_output_vs_bf16", outputs[index], outputs[0])
+        _metric(f"loss_step={step + 1}/fused_output_vs_mxfp8", outputs[2], outputs[1])
+    for model in models[1:]:
+        assert len(model.mlp.experts.quantizer.npu_ops.calls) > 0
+    fused_ops = models[2].mlp.experts.quantizer.npu_ops
+    assert fused_ops.fused_forward == 3 and fused_ops.fused_backward == 3
+    print(json.dumps({"three_way_losses": trajectories, "loss_definition": "sum(output.float()**2)",
+                      "steps": 3, "learning_rate": .1}), flush=True)

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ============================================================================
-"""Non-fused MXFP8 local computation with the GroupedExperts parameter contract."""
+"""MXFP8 local computation with optional fusion and the GroupedExperts contract."""
 
 from __future__ import annotations
 
@@ -26,7 +26,10 @@ from transformers.activations import ACT2FN
 
 from hyper_parallel.components.modules.grouped_experts import GroupedExperts
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import npu_quant_grouped_linear
-from hyper_parallel.components.quantization.functional.npu_mxfp8 import validate_npu_gmm_runtime
+from hyper_parallel.components.quantization.functional.mxfp8_fused_grouped_swiglu import fused_grouped_swiglu
+from hyper_parallel.components.quantization.functional.npu_mxfp8 import (
+    validate_npu_gmm_runtime, validate_npu_swiglu_runtime,
+)
 from hyper_parallel.components.quantization.quantizers.mxfp8 import MXFP8Quantizer
 from hyper_parallel.models.replacement import module_replacement
 
@@ -81,7 +84,7 @@ class MXFP8GroupedSwiGLU(GroupedExperts):
 
     def _grouped_gemm_expert_forward(self, gate_up_proj, down_proj, permuted,
                                      tokens_per_expert, permuted_probs):
-        """Compute GMM1, plain SiLU/multiply, GMM2 without applying scores."""
+        """Validate expert groups and dispatch local math without applying scores."""
         del permuted_probs
         counts = tokens_per_expert.to(device=permuted.device)
         if counts.ndim != 1 or counts.shape[0] != gate_up_proj.shape[0]:
@@ -93,9 +96,31 @@ class MXFP8GroupedSwiGLU(GroupedExperts):
         if tokens_per_expert.device.type == "cpu":
             if bool((tokens_per_expert < 0).any()) or int(tokens_per_expert.sum()) != permuted.shape[0]:
                 raise ValueError(f"{self.module_fqn}: counts must be non-negative and sum to token count")
+        return self._local_compute(permuted, gate_up_proj, down_proj, counts)
+
+    def _local_compute(self, permuted, gate_up_proj, down_proj, counts):
+        """Run the non-fused local chain after common protocol validation."""
         projected = npu_quant_grouped_linear(
             permuted, gate_up_proj.transpose(-2, -1), counts, self.quantizer, group_list_type=1)
         gate, up = projected.chunk(2, dim=-1)
         activated = F.silu(gate) * up
         return npu_quant_grouped_linear(
             activated, down_proj.transpose(-2, -1), counts, self.quantizer, group_list_type=1)
+
+
+@module_replacement
+class FusedMXFP8GroupedSwiGLU(MXFP8GroupedSwiGLU):
+    """Use fused activation/quantization while retaining the same family contract."""
+
+    def __init__(self, *, module: nn.Module, module_fqn: str = "",
+                 context: Mapping[str, Any] | None = None) -> None:
+        """Validate both fused kernels during construction, with module diagnostics."""
+        super().__init__(module=module, module_fqn=module_fqn, context=context)
+        try:
+            validate_npu_swiglu_runtime()
+        except RuntimeError as exc:
+            raise RuntimeError(f"{module_fqn or '<root>'}: {exc}") from exc
+
+    def _local_compute(self, permuted, gate_up_proj, down_proj, counts):
+        """Use one autograd boundary without passing quantized carriers between nodes."""
+        return fused_grouped_swiglu(permuted, gate_up_proj, down_proj, counts, self.quantizer)

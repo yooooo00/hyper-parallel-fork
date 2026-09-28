@@ -76,12 +76,11 @@ def resolve_module_family_target(target: Callable, arguments: Mapping) -> tuple[
         raise ValueError(f"{target}: low-precision selectors require a registered ModuleFamily")
     if any(not isinstance(value, bool) for value in selectors.values()):
         raise TypeError("ModuleFamily selectors must be bool")
-    if selectors.get("use_fused_mxfp8", False):
-        if not selectors.get("use_mxfp8", False):
-            raise ValueError("use_fused_mxfp8 requires use_mxfp8=True")
-        raise NotImplementedError("use_fused_mxfp8=True is not supported; use non-fused MXFP8")
+    if selectors.get("use_fused_mxfp8", False) and not selectors.get("use_mxfp8", False):
+        raise ValueError("use_fused_mxfp8 requires use_mxfp8=True")
     if selectors.get("use_mxfp8", False):
-        module_path, _, name = family.variants["mxfp8"].rpartition(".")
+        variant = "fused_mxfp8" if selectors.get("use_fused_mxfp8") else "mxfp8"
+        module_path, _, name = family.variants[variant].rpartition(".")
         target = getattr(import_module(module_path), name)
     parameters = signature(target).parameters
     unknown = set(args) - {key for key, value in parameters.items()
@@ -95,5 +94,8 @@ def resolve_module_family_target(target: Callable, arguments: Mapping) -> tuple[
 register_module_family(ModuleFamily(
     name="grouped_experts",
     baseline=GroupedExperts,
-    variants={"mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.MXFP8GroupedSwiGLU"},
+    variants={
+        "mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.MXFP8GroupedSwiGLU",
+        "fused_mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.FusedMXFP8GroupedSwiGLU",
+    },
 ))

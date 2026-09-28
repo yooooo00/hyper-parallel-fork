@@ -27,6 +27,8 @@ from torch import nn
 
 from hyper_parallel.components.modules import GroupedExperts, MXFP8GroupedSwiGLU
 from hyper_parallel.components.quantization.modules import MXFP8GroupedExperts
+from hyper_parallel.components.modules.mxfp8_grouped_swiglu import FusedMXFP8GroupedSwiGLU
+from hyper_parallel.components.quantization.functional.npu_mxfp8 import MXFP8NpuOps
 from hyper_parallel.components.quantization.quantizers.mxfp8 import MXFP8Quantizer
 from hyper_parallel.models.replacement import _apply_module_replacement_actions, module_replacement
 from hyper_parallel.distributed._builder.module_family import validate_module_family_plan
@@ -70,6 +72,30 @@ class ModuleFamilyTests(unittest.TestCase):
         ops = patch.object(MXFP8Quantizer, "npu_ops", new_callable=PropertyMock, return_value=IdentityMXOps())
         ops.start()
         self.addCleanup(ops.stop)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_fused_selection_and_capability(self):
+        """
+        Feature: Fused GroupedExperts family selection.
+        Description: Select fusion through real configuration and replacement, isolating only device capability.
+        Expectation: Canonical weights and inherited routing remain intact; missing kernels report the module FQN.
+        """
+        config = family_config(use_mxfp8=True, use_fused_mxfp8=True)
+        with patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_swiglu_runtime"):
+            model = TinyMoE()
+            replace_experts(model, config)
+            self.assertIs(type(model.mlp.experts), FusedMXFP8GroupedSwiGLU)
+            self.assertEqual(set(model.mlp.experts.state_dict()), {"gate_up_proj", "down_proj"})
+            self.assertIs(FusedMXFP8GroupedSwiGLU.forward, GroupedExperts.forward)
+            self.assertIs(FusedMXFP8GroupedSwiGLU.make_transforms, GroupedExperts.make_transforms)
+        with patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_swiglu_runtime",
+                          side_effect=RuntimeError("missing fused kernels")):
+            with self.assertRaisesRegex(RuntimeError, "mlp.experts.*missing fused kernels"):
+                replace_experts(TinyMoE(), config)
+        fake = SimpleNamespace(_torch_npu=SimpleNamespace())
+        with self.assertRaisesRegex(RuntimeError, "requires"):
+            MXFP8NpuOps.validate_swiglu_fusion(fake)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -143,8 +169,7 @@ class ModuleFamilyTests(unittest.TestCase):
         Description: Fusion, non-boolean selectors and unknown arguments fail in the real parser.
         Expectation: Accepted contracts hold and unsupported requests fail explicitly.
         """
-        for kwargs in ({"use_fused_mxfp8": True}, {"use_mxfp8": True, "use_fused_mxfp8": True},
-                       {"use_mxfp8": "true"}, {"typo": 1}, {"use_mxfp8": True, "typo": 1}):
+        for kwargs in ({"use_fused_mxfp8": True}, {"use_mxfp8": "true"}, {"typo": 1}, {"use_mxfp8": True, "typo": 1}):
             with self.subTest(kwargs=kwargs), self.assertRaises(ConfigResolutionError):
                 family_config(**kwargs)
         raw = family_config().to_dict()
