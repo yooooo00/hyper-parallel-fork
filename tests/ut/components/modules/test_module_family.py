@@ -139,6 +139,47 @@ class ModuleFamilyTests(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_loaded_weights_survive_replacement_without_reload(self):
+        """
+        Feature: Replacement after single-device native checkpoint loading.
+        Description: Execute the production replacement entry without the test helper's checkpoint conversion.
+        Expectation: Baseline and both MXFP8 variants preserve already loaded source values and freezing.
+        """
+        for low, fused in ((False, False), (True, False), (True, True)):
+            with self.subTest(low=low, fused=fused):
+                model = TinyMoE().eval()
+                source = model.mlp.experts
+                source.down_proj.requires_grad_(False)
+                expected = {name: value.detach().transpose(-2, -1).clone()
+                            for name, value in source.named_parameters()}
+                config = family_config(use_mxfp8=low, use_fused_mxfp8=fused)
+                _apply_module_replacement_actions(
+                    model, entries_to_module_replacements(config.plan_overrides), weights_mapping=[])
+                for name, value in model.mlp.experts.named_parameters():
+                    torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
+                self.assertFalse(model.mlp.experts.down_proj.requires_grad)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_loaded_baseline_bias_survives_renaming(self):
+        """
+        Feature: Loaded baseline parameters with source bias names.
+        Description: Replace a materialized baseline through the production executor.
+        Expectation: Bias values and frozen state survive renaming without a checkpoint reload.
+        """
+        model = TinyMoE()
+        source = model.mlp.experts
+        source.gate_up_proj_bias = nn.Parameter(torch.randn(4, 512), requires_grad=False)
+        source.down_proj_bias = nn.Parameter(torch.randn(4, 128))
+        config = family_config()
+        _apply_module_replacement_actions(
+            model, entries_to_module_replacements(config.plan_overrides), weights_mapping=[])
+        torch.testing.assert_close(model.mlp.experts.bias1, source.gate_up_proj_bias, rtol=0, atol=0)
+        torch.testing.assert_close(model.mlp.experts.bias2, source.down_proj_bias, rtol=0, atol=0)
+        self.assertFalse(model.mlp.experts.bias1.requires_grad)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_overrides_and_python_target(self):
         """
         Feature: GroupedExperts module family.

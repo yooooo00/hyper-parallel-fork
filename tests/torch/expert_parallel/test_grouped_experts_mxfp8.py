@@ -74,3 +74,15 @@ def test_three_way_loss():
     Expectation: Losses and gradients are finite, outputs meet original tolerances, and fused kernels execute.
     """
     torchrun_case("tests/torch/expert_parallel/_test_grouped_experts_mxfp8.py", "test_three_way_loss", num_proc=1)
+
+
+@arg_mark(plat_marks=["platform_ascend910b"], level_mark="level1",
+          card_mark="onecard", essential_mark="essential")
+@pytest.mark.parametrize("case", ["test_fused_boundary", "test_fused_offload_checkpoint"])
+def test_fused_lifecycle_and_boundary(case):
+    """
+    Feature: Fused operator boundaries and saved-tensor lifecycle on real A5.
+    Description: Isolate activation quantization and exercise CPU offload plus recomputation.
+    Expectation: Original numerical tolerances and exact lifecycle comparisons pass.
+    """
+    torchrun_case("tests/torch/expert_parallel/_test_grouped_experts_mxfp8.py", case, num_proc=1)

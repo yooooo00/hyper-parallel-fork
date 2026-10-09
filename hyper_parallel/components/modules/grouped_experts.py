@@ -139,7 +139,11 @@ class GroupedExperts(nn.Module):
             return partial(_swiglu, dim=-1)
 
         def glu(x: torch.Tensor) -> torch.Tensor:
-            """Apply the configured gated linear unit."""
+            """Apply the configured gated linear unit.
+
+            Args:
+                x: Packed gate and value projections along the final dimension.
+            """
             gate, value = torch.chunk(x, 2, dim=-1)
             return activation_func(gate) * value
 
@@ -188,6 +192,13 @@ class GroupedExperts(nn.Module):
                 torch.empty(npu_down_shape, device=source_down.device, dtype=source_down.dtype),
                 requires_grad=source_down.requires_grad,
             )
+            # Single-device HF loading precedes replacement. Meta construction
+            # is populated later through make_transforms(), but loaded weights
+            # must survive replacement without a second checkpoint load.
+            if not source_gate_up.is_meta:
+                with torch.no_grad():
+                    target_gate_up.copy_(source_gate_up.transpose(-2, -1))
+                    self.down_proj.copy_(source_down.transpose(-2, -1))
         else:
             target_gate_up = source_gate_up
             self.down_proj = source_down
@@ -219,9 +230,9 @@ class GroupedExperts(nn.Module):
                 target_biases.append(source_bias)
             else:
                 target_biases.append(
-                    nn.Parameter(torch.empty_like(source_bias), requires_grad=source_bias.requires_grad)
+                    nn.Parameter(source_bias.detach().clone(), requires_grad=source_bias.requires_grad)
                 )
-        # astroid cannot infer the length of a list built by appends in a
+        # The static analyzer cannot infer the length of a list built by appends in a
         # loop; the zip above always yields exactly two entries.
         self.bias1, self.bias2 = target_biases  # pylint: disable=W0632
 
@@ -456,7 +467,13 @@ class GroupedExperts(nn.Module):
         top_k_index: torch.Tensor,
         top_k_weights: torch.Tensor,
     ) -> torch.Tensor:
-        """Run grouped experts with the Transformers Experts interface."""
+        """Run grouped experts with the Transformers Experts interface.
+
+        Args:
+            hidden_states: Token states with the hidden dimension last.
+            top_k_index: Per-token indices of the selected experts.
+            top_k_weights: Per-token routing weights for the selected experts.
+        """
         hidden_shape = hidden_states.shape
         hidden_states_flat = hidden_states.view(-1, hidden_states.shape[-1])
         permuted_tokens, sorted_indices = expert_ops.moe_token_permute(  # pylint: disable=not-callable

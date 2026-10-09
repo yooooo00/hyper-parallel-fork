@@ -30,10 +30,13 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.core.dtensor.device_mesh import init_device_mesh
 from hyper_parallel.components.quantization.functional.npu_mxfp8 import MXFP8NpuOps
 from hyper_parallel.components.quantization.tensor import QuantizedTensor
+from hyper_parallel.components.quantization.quantizers.mxfp8 import MXFP8Quantizer
+from hyper_parallel.components.quantization.functional.mxfp8_fused_grouped_swiglu import _fused_quant
 from hyper_parallel.distributed._builder.planner import ShardingPlanner
 from hyper_parallel.distributed.apply import apply_sharding_plan
 from hyper_parallel.trainer.config import entries_to_plan_overrides
@@ -110,6 +113,92 @@ def _metric(name, actual, reference):
     assert maximum <= .5 * ref_max + 1e-6, result
 
 
+def _dequantize_rows(operand):
+    """Decode valid row E8M0 blocks on CPU, excluding physical padding."""
+    payload = operand.row_data.cpu().float()
+    exponent = operand.row_scale.cpu().view(torch.uint8).reshape(payload.shape[0], -1).float()
+    scale = torch.pow(2., exponent - 127).repeat_interleave(32, dim=-1)[:, :payload.shape[-1]]
+    return payload * scale
+
+
+def _dequantize_columns(operand, counts):
+    """Decode grouped E8M0 scales, excluding per-expert and allocation padding."""
+    payload = operand.col_data.cpu().float()
+    exponents = operand.col_scale.cpu().view(torch.uint8).float()
+    result = torch.empty_like(payload)
+    token_offset = 0
+    for expert_index, count in enumerate(counts.cpu().tolist()):
+        # The kernel reserves floor(total_tokens / 64) + num_experts packs;
+        # each expert starts at floor(its token offset / 64) + expert index.
+        scale_offset = token_offset // 64 + expert_index
+        packed_blocks = (count + 63) // 64
+        exponent = exponents[scale_offset:scale_offset + packed_blocks].permute(0, 2, 1)
+        exponent = exponent.reshape(-1, payload.shape[1]).repeat_interleave(32, dim=0)[:count]
+        result[token_offset:token_offset + count] = (
+            payload[token_offset:token_offset + count] * torch.pow(2., exponent - 127))
+        token_offset += count
+    return result
+
+
+def test_fused_boundary():
+    """Compare fixed SwiGLU inputs before any GMM or communication can differ."""
+    device, _ = _device()
+    torch.manual_seed(793862)
+    quantizer = MXFP8Quantizer()
+    counts = torch.tensor([1, 0, 31, 32, 33], device=device, dtype=torch.int64)
+    exact = torch.cat([torch.full((count, 64), float(2 ** (index * 3)), device=device, dtype=torch.bfloat16)
+                       for index, count in enumerate(counts.cpu().tolist())])
+    exact_q = quantizer.quantize(exact, group_list=counts, group_list_type=1, colwise=True)
+    torch.testing.assert_close(_dequantize_columns(exact_q, counts), exact.cpu().float(), rtol=0, atol=0)
+    projected = torch.randn(97, 512, device=device, dtype=torch.bfloat16, requires_grad=True)
+    gate, up = projected.chunk(2, -1)
+    activated = F.silu(gate) * up
+    upstream = torch.randn_like(activated)
+    derivative, = torch.autograd.grad(activated, projected, upstream)
+    for name, reference, gradient in (("forward", activated, None), ("backward", derivative, upstream)):
+        plain = quantizer.quantize(reference, group_list=counts, group_list_type=1, rowwise=True, colwise=True)
+        fused = _fused_quant(projected.detach(), quantizer, counts, gradient)
+        _metric(f"boundary_{name}_row_dequant", _dequantize_rows(fused), _dequantize_rows(plain))
+        _metric(f"boundary_{name}_vs_bf16", _dequantize_rows(fused), reference.detach().cpu())
+        _metric(f"boundary_{name}_column_dequant", _dequantize_columns(fused, counts),
+                _dequantize_columns(plain, counts))
+        _metric(f"boundary_{name}_column_vs_bf16", _dequantize_columns(fused, counts), reference.detach().cpu())
+        for field in ("row_data", "row_scale", "col_data", "col_scale"):
+            actual = getattr(fused, field).cpu().view(torch.uint8)
+            expected = getattr(plain, field).cpu().view(torch.uint8)
+            assert actual.shape == expected.shape
+            # Column scale storage contains padding; its raw diff is diagnostic, not a numerical criterion.
+            print(json.dumps({"boundary": name, "buffer": field, "shape": list(actual.shape),
+                              "different_bytes_including_padding": int((actual != expected).sum())}), flush=True)
+
+
+def test_fused_offload_checkpoint():
+    """Exercise real fusion with CPU saved buffers and non-reentrant recomputation."""
+    device, backend = _device()
+    torch.manual_seed(862793)
+    model = TinyMoE(dtype=torch.bfloat16).to(device)
+    replace_experts(model, family_config(use_mxfp8=True, use_fused_mxfp8=True))
+    expert = model.mlp.experts
+    expert.quantizer._npu_ops = CountingMXOps(backend)
+    counts = torch.tensor([1, 0, 31, 33], device=device, dtype=torch.int64)
+    inputs = torch.randn(65, 128, device=device, dtype=torch.bfloat16, requires_grad=True)
+    upstream = torch.randn_like(inputs)
+    variables = (inputs, expert.gate_up_proj, expert.down_proj)
+    reference = expert.forward_expert_major(inputs, counts)
+    expected = torch.autograd.grad(reference, variables, upstream)
+    for recompute in (False, True):
+        with torch.autograd.graph.save_on_cpu(pin_memory=False):
+            output = (checkpoint(expert.forward_expert_major, inputs, counts, use_reentrant=False)
+                      if recompute else expert.forward_expert_major(inputs, counts))
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        for _ in range(2):
+            gradients = torch.autograd.grad(output, variables, upstream, retain_graph=True)
+            for actual, target in zip(gradients, expected):
+                torch.testing.assert_close(actual, target, rtol=0, atol=0)
+    assert expert.quantizer.npu_ops.fused_forward > 3
+    assert expert.quantizer.npu_ops.fused_backward == 5
+
+
 def _bf16_local(experts, x, counts):
     """Plain reference with identical expert token groups and BF16 boundaries."""
     outputs = []
@@ -150,7 +239,11 @@ def _check_local_case(expert, baseline, counts, frozen, device):
 
 @pytest.mark.parametrize("fused", [False, True])
 def test_single_device(fused):
-    """Fixed routing, output/dX/dW, empty/frozen/repeated backward and three updates."""
+    """Fixed routing, output/dX/dW, empty/frozen/repeated backward and three updates.
+
+    Args:
+        fused: Whether to exercise fused activation and quantization.
+    """
     device, backend = _device()
     torch.manual_seed(793)
     source = TinyMoE(dtype=torch.bfloat16).to(device)
@@ -202,7 +295,9 @@ def test_single_device(fused):
     if fused:
         assert ops.fused_forward > 0 and ops.fused_backward > 0
     torch.npu.synchronize()
-    print(json.dumps({"fused": fused, "fusion_calls": [ops.fused_forward, ops.fused_backward], "single_device": "passed", "gmm_calls": len(ops.calls), "three_step_losses": losses}), flush=True)
+    print(json.dumps({"fused": fused, "fusion_calls": [ops.fused_forward, ops.fused_backward],
+                      "single_device": "passed", "gmm_calls": len(ops.calls),
+                      "three_step_losses": losses}), flush=True)
 
 
 def _ep_config(fused=False):
@@ -301,7 +396,11 @@ def _check_ep_case(model, reference_experts, rank, device, hooks, empty_rank):
 
 @pytest.mark.parametrize("fused", [False, True])
 def test_ep_two(fused):
-    """Real planner/apply + Qwen3 recipe; cross-rank routing and an empty receiving rank."""
+    """Real planner/apply + Qwen3 recipe; cross-rank routing and an empty receiving rank.
+
+    Args:
+        fused: Whether to exercise fused activation and quantization.
+    """
     device, backend = _device()
     if int(os.environ.get("WORLD_SIZE", "1")) != 2:
         pytest.skip("Run with torchrun --nproc-per-node=2")
@@ -333,7 +432,8 @@ def test_ep_two(fused):
         handle.remove()
         assert len(hooks) == 2 and len(ops.calls) > 0
         assert not fused or (ops.fused_forward > 0 and ops.fused_backward > 0)
-        print(json.dumps({"fused": fused, "fusion_calls": [ops.fused_forward, ops.fused_backward], "rank": rank, "gmm_calls": len(ops.calls), "ep_two": "passed"}), flush=True)
+        print(json.dumps({"fused": fused, "fusion_calls": [ops.fused_forward, ops.fused_backward],
+                          "rank": rank, "gmm_calls": len(ops.calls), "ep_two": "passed"}), flush=True)
         torch.npu.synchronize()
     finally:
         dist.destroy_process_group()
@@ -431,6 +531,19 @@ def test_ep_fused_comparison():
         dist.destroy_process_group()
 
 
+def _loss_update(model, optimizer, inputs):
+    """Perform one finite-gradient SGD update and retain its comparison values."""
+    optimizer.zero_grad(set_to_none=True)
+    inputs = inputs.detach().clone().requires_grad_()
+    output = model(inputs)
+    loss = output.float().square().sum()
+    loss.backward()
+    assert torch.isfinite(loss) and torch.isfinite(inputs.grad).all()
+    assert all(parameter.grad is not None and torch.isfinite(parameter.grad).all() for parameter in model.parameters())
+    optimizer.step()
+    return output.detach(), loss.item()
+
+
 def test_three_way_loss():
     """Compare BF16/unfused/fused loss trajectories from identical initial weights."""
     device, backend = _device()
@@ -454,16 +567,9 @@ def test_three_way_loss():
     for step in range(3):
         outputs = []
         for name, model, optimizer in zip(names, models, optimizers):
-            optimizer.zero_grad(set_to_none=True)
-            inputs = x.detach().clone().requires_grad_()
-            output = model(inputs)
-            loss = output.float().square().sum()
-            trajectories[name].append(loss.item())
-            outputs.append(output.detach())
-            loss.backward()
-            assert torch.isfinite(loss) and torch.isfinite(inputs.grad).all()
-            assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
-            optimizer.step()
+            output, loss = _loss_update(model, optimizer, x)
+            trajectories[name].append(loss)
+            outputs.append(output)
         for index in (1, 2):
             _metric(f"loss_step={step + 1}/{names[index]}_output_vs_bf16", outputs[index], outputs[0])
         _metric(f"loss_step={step + 1}/fused_output_vs_mxfp8", outputs[2], outputs[1])

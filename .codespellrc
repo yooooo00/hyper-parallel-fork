@@ -1,0 +1,3 @@
+[codespell]
+# Ascend's Compute Architecture for Neural Networks software stack.
+ignore-words-list = cann

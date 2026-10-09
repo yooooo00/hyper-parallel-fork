@@ -51,6 +51,15 @@
 
 没有整体拷贝旧分支的 GMM functional，也没有改动现有量化器对输入类型的契约。参考旧分支的两个 NPU 接口适配方法后，融合流程在新的独立文件中实现。
 
+## 2026-10-09 完整 Trainer 实测补充
+
+后续 A5 验收发现并修复了单卡原生权重加载后，GroupedExperts 转置替换未保留
+已加载参数值的问题。修复后完成 EP=1/2 × BF16/非融合/融合六组各 10 步真实
+Qwen3-MoE TextTrainer 训练、精确断点恢复，以及融合 full 重算对照。
+环境来源、实际 CE 差异、完整命令、设备运行时异常和未验证范围见
+[A5 真实训练验收记录](grouped_experts_mxfp8_a5_validation.md)。
+下文历史数据仍对应原测试时间和源码版本。
+
 ## 本轮融合路径
 
 配置示例：
@@ -139,7 +148,6 @@ python -m pytest -q -s tests/torch/expert_parallel/test_grouped_experts_mxfp8.py
 
 本轮新增/修改的代码集中在 Family 选择、低精模块、NPU 融合适配、新融合 functional 和对应 CPU/设备测试。原有 MXFP8 GMM、Dense functional、Router、All-to-All 和模型输出组合未改动。
 
-
 ## 2026-09-28：统一 #862 保存逻辑及 EP=2 直接对照
 
 `use_fused_mxfp8` 已通过真实配置解析选择融合子类；本次继续保留旧分支的融合语义，即 SwiGLU 与 MXFP8 双轴量化的前向、反向融合，而不恢复跨 autograd Function 的量化 carrier 传递。
@@ -174,7 +182,6 @@ python -m pytest -q -s \
 ```
 
 本次环境为 Python 3.10.21、PyTorch 2.9.0+cpu、torch-npu 2.9.0.post7+gitddd16dd，设备 Ascend950PR_9589，使用设备 0/1。本次证据独立保存在 `/home/c00913822/hp-validation/fused-20260928/`：`cpu.log`、`devices.log`、各 rank stdout/stderr、`metrics.json`、`environment.json` 和 `pylint.log`。
-
 
 ## 2026-09-28：BF16、非融合 MXFP8 与融合 MXFP8 的 loss 对照
 
