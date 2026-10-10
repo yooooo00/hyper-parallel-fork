@@ -25,8 +25,8 @@ AutoModels objects and never imports trainer config (05 §15.2.6).
 import logging
 from typing import Any, Dict, Literal, Optional, Union
 
-import torch
-from torch import nn
+import torch  # pylint: disable=forbidden-backend-import
+from torch import nn  # pylint: disable=forbidden-backend-import
 from transformers import PreTrainedModel
 from hyper_parallel import DTensor
 from hyper_parallel.core.fully_shard.hsdp_utils import get_hsdp_state
@@ -218,6 +218,7 @@ def _plan_and_apply_sharding(
     sharding_planner,
     is_hf_model: bool,
     validate_placement: bool,
+    source_gradient_reduction: bool = False,
 ) -> tuple[nn.Module, Optional[dict]]:
     """Plan parameter layouts and apply dual-mode sharding when requested."""
     model_sharding_requested = (
@@ -251,6 +252,7 @@ def _plan_and_apply_sharding(
         ep_size=mesh.ep_size,
         sequence_parallel=mesh.sequence_parallel,
         loss_parallel=mesh.loss_parallel,
+        source_gradient_reduction=source_gradient_reduction,
     )
     model, source_shard_info = apply_sharding_plan(
         model,
@@ -341,6 +343,7 @@ def _apply_pre_sharding_features(
     fp8_config: Optional[Any],
 ) -> None:
     """Apply or report optional features that precede sharding."""
+    del model
     if peft_config is not None:
         logger.warning("PEFT injection not implemented in stub")
     if qat_config is not None:
@@ -426,6 +429,32 @@ def apply_model_infrastructure(
     materialization/loading -> per-layer compile. Placement validation keeps
     the DTensor placement path and skips compile, while FSDP2 consumes DTensor
     parameter layouts in both modes.
+
+    Args:
+        model: Source model to replace, shard and prepare for training.
+        mesh: Runtime mesh domains and parallel sizes.
+        sharding_planner: Planner that derives parameter and activation placements.
+        fsdp2_manager: Optional manager for parameter sharding and gradient reduction.
+        peft_config: Compatibility configuration for parameter-efficient fine-tuning.
+        qat_config: Compatibility configuration for quantization-aware training.
+        fp8_config: Compatibility configuration for the legacy FP8 preparation hook.
+        freeze_config: Reserved freezing configuration; currently emits a warning.
+        compile_config: Per-layer compilation settings or their serialized mapping.
+        activation_checkpoint: Activation checkpointing mode.
+        activation_swap: Activation offload mode.
+        swap_inputs: Whether activation offload also includes wrapper inputs.
+        is_meta_device: Whether parameter storage must first be materialized.
+        is_hf_model: Whether planning should use the native model architecture metadata.
+        device: Target device for parameter materialization and loading.
+        load_base_model: Whether to load checkpoint values instead of initializing weights.
+        pretrained_path: Source checkpoint path when base-model loading is enabled.
+        validate_placement: Whether execution retains the DTensor validation path.
+        low_precision_config: Precision configuration forwarded to replacement construction.
+        model_init_dtype: Optional final model dtype applied after loading.
+        **kwargs: Infrastructure context, including the resolved distributed setup.
+
+    Returns:
+        The model with the selected replacements and runtime infrastructure installed.
     """
 
     distributed_setup = kwargs.get("distributed_setup")
@@ -457,6 +486,7 @@ def apply_model_infrastructure(
         sharding_planner,
         is_hf_model,
         validate_placement,
+        source_gradient_reduction=fsdp2_manager is not None,
     )
 
     model = _apply_activation_features(
@@ -474,6 +504,10 @@ def apply_model_infrastructure(
         fsdp2_manager,
         source_shard_info,
     )
+    # Plain TP/EP parameters need their source layouts before Trainer installs
+    # HSDP. Keep FQN metadata on the model across meta materialization, which
+    # replaces Parameter objects and would discard parameter attributes.
+    model._hp_checkpoint_source_shard_info = source_shard_info  # pylint: disable=protected-access
 
     # Steps 11-12: materialize model storage, then load or initialize weights.
     model = _materialize_and_load_model(

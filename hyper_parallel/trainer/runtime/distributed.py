@@ -1,4 +1,4 @@
-# Copyright 2025 Bytedance Ltd. and/or its affiliates
+# Copyright 2025-2026 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -131,7 +131,17 @@ def initialize_distributed(backend: str = "nccl") -> Any:
 
 
 def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
-    """Create DistributedSetup and build the configured mesh domains."""
+    """Create DistributedSetup and build the configured mesh domains.
+
+    Args:
+        cfg: Resolved training configuration carrying accelerator, FSDP and optimizer settings.
+
+    Returns:
+        Mesh domains and the strategy that owns parameter and gradient synchronization.
+
+    Raises:
+        ValueError: World or data-parallel sizes cannot be divided by the requested mesh sizes.
+    """
     accel = cfg.accelerator if cfg is not None and hasattr(cfg, "accelerator") else None
     if accel is None:
         return DistributedSetup(mesh_context=MeshContext())
@@ -212,9 +222,11 @@ def create_distributed_setup_from_config(cfg: Any) -> DistributedSetup:
         else 0
     )
 
-    fsdp_enabled = dist.is_initialized() and (
-        dp_shard_size > 1 or dp_replicate_size > 1 or edp_shard_size > 1
-    )
+    # TP still needs source-replicated parameter reduction and DTensor-aware
+    # global gradient clipping when the data-parallel mesh has only one rank.
+    fsdp_enabled = dist.is_initialized() and max(
+        dp_shard_size, dp_replicate_size, edp_shard_size, tp_size
+    ) > 1
     strategy_config = fsdp_config if fsdp_enabled else None
     return DistributedSetup(
         mesh_context=mesh_context,

@@ -14,6 +14,8 @@
 # ============================================================================
 """Checkpoint management for finalized HyperParallel models."""
 
+from __future__ import annotations
+
 import json
 import logging
 import re
@@ -23,11 +25,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 from huggingface_hub import snapshot_download
 from safetensors import safe_open
-from torch import nn
-from torch.distributed import is_available, is_initialized
+from torch import nn  # pylint: disable=forbidden-backend-import
+from torch.distributed import is_available, is_initialized  # pylint: disable=forbidden-backend-import
 from hyper_parallel.components.checkpoint.weight_conversion import (
     WeightConverter,
     WeightRenaming,
@@ -38,6 +40,7 @@ from hyper_parallel.components.checkpoint.weight_conversion import (
 )
 
 from hyper_parallel import DTensor, Partial, distribute_tensor
+from hyper_parallel.core.dtensor.layout import Layout
 
 logger = logging.getLogger(__name__)
 
@@ -395,16 +398,27 @@ def _local_target_tensor(target: torch.Tensor) -> torch.Tensor:
     return target.to_local() if isinstance(target, DTensor) else target
 
 
-def _target_layout(target: torch.Tensor) -> Any:
+def _target_layout(target: torch.Tensor, source_shard_info: Any = None) -> Any:
+    """Prefer final HSDP layouts; retain source layouts for plain local shards."""
     if isinstance(target, DTensor) and target.layout is not None:
         return target.layout
-    return getattr(target, "_sharding_spec", None)
+    layout = getattr(target, "_sharding_spec", None)
+    if layout is not None or source_shard_info is None:
+        return layout
+    placements, mesh = source_shard_info
+    if not placements:
+        return None
+    layout = Layout.from_device_mesh(mesh)
+    layout.set_placements(placements)
+    layout.placement_to_tensor_map(target.ndim)
+    return layout
 
 
-def _shard_for_target(target_name: str, full_tensor: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def _shard_for_target(target_name: str, full_tensor: torch.Tensor, target: torch.Tensor,
+                      source_shard_info: Any = None) -> torch.Tensor:
     """Shard a full checkpoint tensor according to its target layout."""
 
-    layout = _target_layout(target)
+    layout = _target_layout(target, source_shard_info)
     if layout is None:
         return full_tensor
     if any(isinstance(placement, Partial) for placement in layout.placements):
@@ -419,10 +433,11 @@ def _shard_for_target(target_name: str, full_tensor: torch.Tensor, target: torch
     return local_dtensor.to_local()
 
 
-def _copy_into_target(target_name: str, full_tensor: torch.Tensor, target: torch.Tensor) -> None:
+def _copy_into_target(target_name: str, full_tensor: torch.Tensor, target: torch.Tensor,
+                      source_shard_info: Any = None) -> None:
     """Copy a checkpoint tensor into its materialized local target."""
 
-    local_tensor = _shard_for_target(target_name, full_tensor, target)
+    local_tensor = _shard_for_target(target_name, full_tensor, target, source_shard_info)
     destination = _local_target_tensor(target)
     if destination.is_meta:
         raise ValueError(f"Target must be materialized before loading: {target_name}")
@@ -444,7 +459,8 @@ def _alias_names_by_target(targets: dict[str, torch.Tensor]) -> dict[int, set[st
     return aliases
 
 
-def _copy_converted_tensors(converted, targets, aliases_by_target, loaded_keys, loaded_target_ids):
+def _copy_converted_tensors(converted, targets, aliases_by_target, loaded_keys, loaded_target_ids,
+                            source_shard_info):
     """Copy each physical target once and account for all of its aliases."""
     unexpected_keys = ()
     for target_name, tensor in converted.items():
@@ -455,7 +471,7 @@ def _copy_converted_tensors(converted, targets, aliases_by_target, loaded_keys, 
         tensor = tensor[0] if isinstance(tensor, list) else tensor
         target_id = id(target)
         if target_id not in loaded_target_ids:
-            _copy_into_target(target_name, tensor, target)
+            _copy_into_target(target_name, tensor, target, source_shard_info.get(target_name))
             loaded_target_ids.add(target_id)
         loaded_keys.update(aliases_by_target[target_id])
     return unexpected_keys
@@ -478,6 +494,7 @@ class CheckpointManager:
     ) -> None:
         """Bind the manager to one finalized model and an optional DCP backend."""
         self.model = model
+        self.source_shard_info = getattr(model, "_hp_checkpoint_source_shard_info", None) or {}
         self.dcp_backend = dcp_backend
 
     def load_checkpoint(
@@ -536,6 +553,7 @@ class CheckpointManager:
         for group in groups:
             unexpected_keys += _copy_converted_tensors(
                 self._convert_group(group), targets, aliases_by_target, loaded_keys, loaded_target_ids,
+                self.source_shard_info,
             )
 
         return self._finish_standard_load(
@@ -596,6 +614,7 @@ class CheckpointManager:
         for converted in self._iter_replacement_tensors(base_groups, source_model, routes, used_replacements):
             unexpected_keys += _copy_converted_tensors(
                 converted, targets, aliases_by_target, loaded_keys, loaded_target_ids,
+                self.source_shard_info,
             )
         return loaded_keys, unexpected_keys, used_replacements
 
@@ -773,7 +792,7 @@ class CheckpointManager:
             if isinstance(value, DTensor):
                 value = value.full_tensor()
             elif isinstance(value, torch.Tensor):
-                layout = getattr(value, "_sharding_spec", None)
+                layout = _target_layout(value, self.source_shard_info.get(name))
                 if layout is not None:
                     value = DTensor.from_local_with_layout(value.detach(), layout).full_tensor()
                 else:
