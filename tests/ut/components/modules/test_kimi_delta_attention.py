@@ -369,3 +369,38 @@ def test_kda_state_summary_keeps_fp32_state_under_autocast():
     assert state_ext.dtype == torch.float32
     assert transition.dtype == torch.float32
     assert final_state.dtype == torch.float32
+
+
+def test_default_chunk_decay_masks_before_exp_in_forward_and_backward():
+    """Large future-token decays must not poison valid causal gate gradients."""
+    torch.manual_seed(793)
+    source = [
+        torch.randn(1, 64, 2, 4) * .1,
+        torch.randn(1, 64, 2, 4) * .1,
+        torch.randn(1, 64, 2, 3) * .1,
+        torch.full((1, 64, 2, 4), -4.),
+        torch.full((1, 64, 2), .5),
+    ]
+    expected = [tensor.clone().requires_grad_() for tensor in source]
+    actual = [tensor.clone().requires_grad_() for tensor in source]
+    reference_output, reference_state = torch_recurrent_kda(*expected, output_final_state=True)
+    output, state = torch_chunk_kda(*actual, output_final_state=True, chunk_size=64)
+    torch.testing.assert_close(output, reference_output, atol=3e-5, rtol=3e-5)
+    torch.testing.assert_close(state, reference_state, atol=3e-5, rtol=3e-5)
+    reference_grads = torch.autograd.grad(reference_output.sum() + reference_state.sum(), expected)
+    gradients = torch.autograd.grad(output.sum() + state.sum(), actual)
+    for gradient, reference in zip(gradients, reference_grads):
+        assert torch.isfinite(gradient).all()
+        torch.testing.assert_close(gradient, reference, atol=3e-5, rtol=3e-5)
+
+    summary_inputs = [tensor.clone().requires_grad_() for tensor in source]
+    state_ext, _ = torch_kda_state_summary(
+        *summary_inputs, chunk_size=64,
+    )
+    reference_state = torch_recurrent_kda(*expected, output_final_state=True)[1]
+    reference_grads = torch.autograd.grad(reference_state.sum(), expected[1:])
+    gradients = torch.autograd.grad(state_ext.sum(), summary_inputs[1:])
+    torch.testing.assert_close(state_ext, reference_state, atol=3e-5, rtol=3e-5)
+    for gradient, reference in zip(gradients, reference_grads):
+        assert torch.isfinite(gradient).all()
+        torch.testing.assert_close(gradient, reference, atol=3e-5, rtol=3e-5)

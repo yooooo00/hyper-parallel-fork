@@ -21,6 +21,7 @@ primitives (``flex_cp_allgather`` and friends). Split out of
 components/distributed/cp_utils.py + cp_wrappers.py in stage 4e.
 """
 
+from hyper_parallel.distributed.context_parallel.attention_interface import attention_interface_cp_wrapper
 from hyper_parallel.distributed.context_parallel.collectives import (
     AsyncCPCollective,
     async_cp_allgather_launch,
@@ -51,6 +52,7 @@ from hyper_parallel.distributed.context_parallel.wrappers import (
 )
 
 __all__ = [
+    "attention_interface_cp_wrapper",
     "AsyncCPCollective",
     "INNER_WRAPPER_REGISTRY",
     "INNER_WRAPPER_REQUIREMENTS",

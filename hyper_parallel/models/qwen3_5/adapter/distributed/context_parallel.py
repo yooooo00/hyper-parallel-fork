@@ -20,12 +20,12 @@ __all__ = [
     "qwen3_5_gdn_ulysses_cp_wrapper",
 ]
 
-from functools import wraps
 from typing import Any, Type
 
 from torch import nn
 
 from hyper_parallel.distributed import inner_wrapper
+from hyper_parallel.distributed.attention_family.state import build_state_cp_rewrite
 from hyper_parallel.distributed._builder.forward_rewriter import (
     _ForwardRewriteRequest,
 )
@@ -45,42 +45,10 @@ def _build_gdn_cp_rewrite(
     backend: str,
     chunk_size: int,
 ) -> _ForwardRewriteRequest:
-    """Validate one GDN target and return an atomic forward rewrite request."""
-    if cp_mesh is None or cp_mesh.size() <= 1:
-        raise ValueError(f"GDN {mode} Context Parallel requires an active CP mesh")
-    if tp_mesh is not None and tp_mesh.size() > 1:
-        raise NotImplementedError(
-            "Qwen3.5 GDN Context Parallel does not yet support simultaneous TP and CP"
-        )
-    if getattr(target_module, "_hp_gdn_cp_config", None) is not None:
-        raise RuntimeError(
-            "Qwen3.5 GDN Context Parallel has already been applied to this module; "
-            "applying a CP wrapper twice is not supported"
-        )
-
-    executor = executor_class(
-        target_module,
-        cp_mesh,
-        backend=backend,
-        chunk_size=chunk_size,
-    )
-    original_forward = target_module.forward
-
-    @wraps(original_forward)
-    def cp_forward(*args: Any, **kwargs: Any) -> Any:
-        """Execute the selected full-layer GDN Context Parallel algorithm."""
-        return executor(*args, **kwargs)
-
-    return _ForwardRewriteRequest(
-        target_module,
-        cp_forward,
-        companion_attrs={
-            "_hp_gdn_cp_config": {
-                "mode": mode,
-                "backend": backend,
-                "chunk_size": chunk_size,
-            },
-        },
+    """Use the shared Family rewrite while preserving model recipe imports."""
+    return build_state_cp_rewrite(
+        target_module, cp_mesh, tp_mesh, family="gdn", mode=mode,
+        executor_class=executor_class, backend=backend, chunk_size=chunk_size,
     )
 
 

@@ -38,8 +38,8 @@ import types
 import weakref
 from typing import Any, Callable, List, Sequence
 
-import torch
-from torch import nn
+import torch  # pylint: disable=forbidden-backend-import
+from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Shard
@@ -1046,6 +1046,10 @@ def _wrap_vocab_parallel_embedding(module, tp_mesh):
     v_local = module.weight.shape[0]
     lo = tp_mesh.get_local_rank() * v_local
     hi = lo + v_local
+    # Native Embedding validates and suppresses gradients using local row
+    # indices. Only the rank owning the global padding row keeps that index.
+    padding_idx = module.padding_idx
+    module.padding_idx = padding_idx - lo if padding_idx is not None and lo <= padding_idx < hi else None
 
     @functools.wraps(original_forward)
     def masked_embedding_forward(
@@ -1081,7 +1085,8 @@ class _ForwardRewriteRequest:
 
     __slots__ = ("target", "forward", "companion_attrs")
 
-    def __init__(self, target, forward, companion_attrs=()):
+    def __init__(self, target: nn.Module, forward: Callable[..., Any], companion_attrs: Any = ()) -> None:
+        """Describe one forward replacement and its accompanying attribute updates."""
         self.target = target
         self.forward = forward
         self.companion_attrs = dict(companion_attrs)

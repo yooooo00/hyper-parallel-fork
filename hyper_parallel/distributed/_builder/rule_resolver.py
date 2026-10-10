@@ -79,8 +79,9 @@ def _merge_plan_overrides(plan_overrides, plan: ShardingPlan, model, *,
       deep-copied and inserted as-is; at least one contract field must
       be declared (an explicit {} counts — the pure I/O-stitch
       boundary) — an override with EVERYTHING unset fails fast
-      ("no template/boundary matched"). Sentinels are rejected (nothing
-      to inherit/clear). Nesting (ancestor/descendant
+      ("no template/boundary matched"). Contract-field sentinels are rejected
+      (nothing to inherit/clear); adapter sentinels retain their default/disable
+      semantics. Nesting (ancestor/descendant
       FQNs) is **allowed** since D-14 (05 §13), subject only to the
       param-uniqueness invariant (``_check_param_uniqueness``);
     - **glob keys** (containing ``*``/``?``/``[``): merge-applied to
@@ -264,12 +265,24 @@ def _merge_into(derived: ModuleShardingSpec,
     """
     for attr in _CONTRACT_FIELDS:
         _merge_contract_field(derived, user_spec, attr)
-    for attr in ("local_compute_fn", "inner_target", "inner_wrapper",
+    for attr in ("local_compute_fn", "inner_target",
                  "inner_out_src", "region_dispatch", "tp_divide_attrs"):
         value = getattr(user_spec, attr)
         if value is not None:
             setattr(derived, attr, value)
+    _merge_inner_wrapper(derived, user_spec.inner_wrapper)
     _normalize_out_fields(derived)
+
+
+def _merge_inner_wrapper(spec: ModuleShardingSpec, wrapper: Any) -> None:
+    """Normalize explicit adapter selection without erasing an inherited default."""
+    if wrapper is not None and wrapper != "auto":
+        disabled = wrapper is False or wrapper == "none"
+        spec.inner_wrapper = None if disabled else wrapper
+        spec._family_adapter_source = "explicit"
+        if disabled:
+            spec.inner_target = None
+            spec.inner_out_src = None
 
 
 def _normalize_contract_fields(plan: ShardingPlan) -> None:
@@ -381,6 +394,10 @@ def _insert_spec(plan: ShardingPlan, fqn: str,
             "spelling"
             + hint)
     spec = copy.deepcopy(user_spec)
+    if spec.inner_wrapper == "auto":
+        spec.inner_wrapper = None
+    else:
+        _merge_inner_wrapper(spec, spec.inner_wrapper)
     _normalize_out_fields(spec)
     logger.info("%s: insert the spec of module %s", source, fqn)
     plan.modules[fqn] = spec

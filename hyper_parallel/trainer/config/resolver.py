@@ -19,6 +19,7 @@ from __future__ import annotations
 __all__ = [
     "ConfigResolutionError",
     "replace_override_path",
+    "replace_override_paths",
     "resolve_config",
 ]
 
@@ -27,7 +28,7 @@ import difflib
 import importlib
 import inspect
 import types
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import MISSING, fields, is_dataclass, replace
 from typing import Any, Literal, Union, get_args, get_origin, get_type_hints
 
@@ -283,6 +284,15 @@ def _normalize_override_scalar(value: object, annotation: object) -> object:
     return value
 
 
+def _normalize_callable(value: object, *, path: str) -> Callable:
+    """Resolve a serialized callable path or validate an existing callable."""
+    if isinstance(value, str):
+        return import_target(value, location=path)
+    if callable(value):
+        return value
+    raise ConfigResolutionError(path, f"expected callable or dotted callable path, got {type(value).__name__}")
+
+
 def normalize_value(value: object, annotation: object, *, path: str) -> object:
     """Validate and normalize a parsed value against its annotation.
 
@@ -313,9 +323,13 @@ def normalize_value(value: object, annotation: object, *, path: str) -> object:
     args = get_args(annotation)
     if origin is Literal:
         return _normalize_literal(value, args, path=path)
+    if origin is Callable or annotation is Callable:
+        return _normalize_callable(value, path=path)
     if origin in _COLLECTION_TYPES or annotation in _COLLECTION_TYPES:
         return _normalize_collection(value, annotation, origin, args, path=path)
     if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
+        if isinstance(value, annotation):
+            return value
         # Nested dataclass items resolve from mappings in the same way as
         # top-level dataclass components.
         return _resolve_dataclass(value, annotation, path=path)
@@ -328,68 +342,172 @@ def _suggestion(name: str, candidates: Iterable[str]) -> str:
     return f"; did you mean {matches[0]!r}?" if matches else ""
 
 
-def _replace_target_path(
-    config: Target[Any],
-    parts: list[str],
-    value: object,
-    *,
-    path: str,
-) -> Target[Any]:
-    """Return a ``Target`` copy with an argument or nested value replaced."""
-    name = parts[0]
-    full_path = f"{path}.{name}" if path else name
-    if name == "_target_":
-        raise ConfigResolutionError(
-            f"CLI.{full_path}", "changing _target_ through an override is not supported"
-        )
+def _group_override_paths(overrides: list[tuple[list[str], object]]) -> dict[str, list]:
+    """Group sibling writes while retaining CLI order within each subtree."""
+    grouped = {}
+    for parts, value in overrides:
+        if not parts:
+            raise ConfigResolutionError("CLI", "override path must not be empty")
+        grouped.setdefault(parts[0], []).append((parts[1:], value))
+    return grouped
 
-    if isinstance(config, ReplacementTarget) and name in ("use_mxfp8", "use_fused_mxfp8"):
-        normalized = normalize_value(value, bool, path=f"CLI.{full_path}")
-        return config.replace(**{name: normalized})
 
-    signature = inspect.signature(config.callable)
-    parameter = signature.parameters.get(name)
-    has_var_kwargs = any(
-        item.kind is inspect.Parameter.VAR_KEYWORD
-        for item in signature.parameters.values()
-    )
-    if parameter is None and not has_var_kwargs:
-        candidates = [
-            item.name
-            for item in signature.parameters.values()
-            if item.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-        ]
-        raise ConfigResolutionError(
-            f"CLI.{full_path}",
-            f"unknown target argument {name!r}{_suggestion(name, candidates)}",
-        )
-
-    if len(parts) > 1:
-        try:
-            child = getattr(config, name)
-        except AttributeError as exc:
-            raise ConfigResolutionError(
-                f"CLI.{full_path}", "target argument is not configured"
-            ) from exc
-        return config.replace(**{name: replace_override_path(child, parts[1:], value, path=full_path)})
-
-    normalized = value
-    if parameter is not None:
-        annotation = _target_hints(config.callable, path=path).get(
-            name,
-            parameter.annotation,
-        )
-        if annotation not in (Any, object, inspect.Signature.empty):
-            normalized = normalize_value(
-                _normalize_override_scalar(value, annotation),
-                annotation,
-                path=f"CLI.{full_path}",
+def _replace_override_value(
+    current: object, overrides: list[tuple[list[str], object]], annotation: object, *, path: str,
+) -> object:
+    """Apply the last whole-value write before any subsequent nested writes."""
+    pending = overrides
+    for index, (parts, value) in enumerate(overrides):
+        if not parts:
+            current = normalize_value(
+                _normalize_override_scalar(value, annotation), annotation, path=f"CLI.{path}"
             )
-    return config.replace(**{name: normalized})
+            pending = overrides[index + 1:]
+    if not pending:
+        return current
+    if current is None:
+        raise ConfigResolutionError(f"CLI.{path}", "component was not selected by the YAML")
+    updated = replace_override_paths(current, pending, path=path)
+    if isinstance(updated, (list, tuple)):
+        return normalize_value(updated, annotation, path=f"CLI.{path}")
+    return updated
+
+
+def _replace_target_overrides(config: Target, grouped: dict[str, list], *, path: str) -> Target:
+    """Select a target once all its selector changes have been collected."""
+    changes = {}
+    for name, overrides in grouped.items():
+        full_path = f"{path}.{name}" if path else name
+        if name == "_target_":
+            raise ConfigResolutionError(
+                f"CLI.{full_path}", "changing _target_ through an override is not supported"
+            )
+        is_selector = isinstance(config, ReplacementTarget) and name in ("use_mxfp8", "use_fused_mxfp8")
+        current = config.selectors.get(name) if is_selector else getattr(config, name, None)
+        changes[name] = _replace_override_value(
+            current, overrides, bool if is_selector else Any, path=full_path
+        )
+
+    try:
+        # Family selection validates the final selector pair, never a transient
+        # combination created by the textual order of command-line arguments.
+        candidate = config.replace(**changes)
+    except (ValueError, TypeError, NotImplementedError) as exc:
+        raise ConfigResolutionError(f"CLI.{path}", str(exc)) from exc
+    signature = inspect.signature(candidate.callable)
+    hints = _target_hints(candidate.callable, path=f"CLI.{path}")
+    normalized = {}
+    for name, value in changes.items():
+        if isinstance(config, ReplacementTarget) and name in ("use_mxfp8", "use_fused_mxfp8"):
+            continue
+        parameter = signature.parameters.get(name)
+        if parameter is None:
+            _validate_target_override_name(name, signature, path=path)
+            continue
+        annotation = hints.get(name, parameter.annotation)
+        if annotation not in (Any, object, inspect.Signature.empty):
+            normalized[name] = normalize_value(
+                _normalize_override_scalar(value, annotation), annotation, path=f"CLI.{path}.{name}"
+            )
+    return candidate.replace(**normalized) if normalized else candidate
+
+
+def _validate_target_override_name(name: str, signature: inspect.Signature, *, path: str) -> None:
+    """Reject unknown arguments on targets without an open keyword contract."""
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+        return
+    candidates = [
+        parameter.name for parameter in signature.parameters.values()
+        if parameter.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    ]
+    raise ConfigResolutionError(
+        f"CLI.{path}.{name}", f"unknown target argument {name!r}{_suggestion(name, candidates)}"
+    )
+
+
+def _replace_sequence_overrides(config: list | tuple, grouped: dict[str, list], *, path: str) -> list | tuple:
+    """Update existing list indices without extending or renumbering the list."""
+    result = list(config)
+    for name, overrides in grouped.items():
+        if not name.isascii() or not name.isdigit() or str(int(name)) != name:
+            raise ConfigResolutionError(f"CLI.{path}.{name}", "expected a non-negative decimal list index")
+        index = int(name)
+        if index >= len(config):
+            raise ConfigResolutionError(
+                f"CLI.{path}.{name}", f"list index {index} is out of range for length {len(config)}"
+            )
+        current = config[index]
+        annotation = type(current) if is_dataclass(current) else Any
+        result[index] = _replace_override_value(current, overrides, annotation, path=f"{path}.{name}")
+    return tuple(result) if isinstance(config, tuple) else result
+
+
+def _replace_dataclass_overrides(
+    config: object, overrides: list[tuple[list[str], object]], *, path: str,
+) -> object:
+    """Update typed fields and retain the shorthand for a wrapped target."""
+    config_fields = {field.name: field for field in fields(config)}
+    hints = get_type_hints(type(config))
+    expanded = []
+    for parts, value in overrides:
+        name = parts[0]
+        if name not in config_fields:
+            if not isinstance(getattr(config, "target", None), Target):
+                raise ConfigResolutionError(
+                    f"CLI.{path}" if path else "CLI",
+                    f"unknown field {name!r} on {type(config).__name__}{_suggestion(name, config_fields)}",
+                )
+            parts = ["target", *parts]
+        expanded.append((parts, value))
+    changes = {
+        name: _replace_override_value(
+            getattr(config, name), pending, hints[name], path=f"{path}.{name}" if path else name
+        )
+        for name, pending in _group_override_paths(expanded).items()
+    }
+    return replace(config, **changes)
+
+
+def replace_override_paths(
+    config: object, overrides: list[tuple[list[str], object]], *, path: str = "",
+) -> object:
+    """Apply a batch of typed dotted-path writes without intermediate selection.
+
+    Args:
+        config: Resolved configuration object or nested value to update.
+        overrides: Parsed path/value pairs in command-line order. Repeated writes
+            use the last value; sibling selectors are validated together.
+        path: Configuration path already traversed, empty at the root.
+
+    Returns:
+        An updated copy; no input configuration or container is modified.
+
+    Raises:
+        ConfigResolutionError: A path, index, argument or value is invalid.
+    """
+    if not overrides:
+        return config
+    grouped = _group_override_paths(overrides)
+    if isinstance(config, Target):
+        return _replace_target_overrides(config, grouped, path=path)
+    if isinstance(config, (list, tuple)):
+        return _replace_sequence_overrides(config, grouped, path=path)
+    if isinstance(config, Mapping):
+        result = dict(config)
+        for name, pending in grouped.items():
+            if name not in config:
+                raise ConfigResolutionError(f"CLI.{path}", f"unknown mapping key {name!r}")
+            result[name] = _replace_override_value(config[name], pending, Any, path=f"{path}.{name}")
+        return result
+    if is_dataclass(config):
+        return _replace_dataclass_overrides(config, overrides, path=path)
+    raise ConfigResolutionError(
+        f"CLI.{path}" if path else "CLI", f"value of type {type(config).__name__} has no configurable fields"
+    )
 
 
 def replace_override_path(config: object, parts: list[str], value: object, *, path: str) -> object:
-    """Return a configuration copy with a dotted-path override applied.
+    """Return a configuration copy with one typed dotted-path override applied.
 
     Args:
         config: Resolved configuration object or nested value to update.
@@ -401,53 +519,9 @@ def replace_override_path(config: object, parts: list[str], value: object, *, pa
         A copy with the override applied; the input is not modified.
 
     Raises:
-        ConfigResolutionError: The path cannot be updated or the value does
-            not match the selected field's annotation.
+        ConfigResolutionError: The path or value cannot be applied.
     """
-    if isinstance(config, Target):
-        return _replace_target_path(config, parts, value, path=path)
-
-    if isinstance(config, Mapping):
-        name = parts[0]
-        full_path = f"{path}.{name}" if path else name
-        if name not in config:
-            raise ConfigResolutionError(f"CLI.{path}", f"unknown mapping key {name!r}")
-        if len(parts) == 1:
-            return {**config, name: value}
-        return {**config, name: replace_override_path(config[name], parts[1:], value, path=full_path)}
-
-    location = f"CLI.{path}" if path else "CLI"
-    if not is_dataclass(config):
-        raise ConfigResolutionError(
-            location, f"value of type {type(config).__name__} has no configurable fields"
-        )
-
-    config_fields = {field.name: field for field in fields(config)}
-    name = parts[0]
-    if name not in config_fields:
-        target = getattr(config, "target", None)
-        if isinstance(target, Target):
-            return replace(config, target=_replace_target_path(target, parts, value, path=path))
-        raise ConfigResolutionError(
-            location,
-            f"unknown field {name!r} on {type(config).__name__}"
-            f"{_suggestion(name, config_fields)}",
-        )
-
-    full_path = f"{path}.{name}" if path else name
-    if len(parts) == 1:
-        annotation = get_type_hints(type(config))[name]
-        normalized = normalize_value(
-            _normalize_override_scalar(value, annotation), annotation, path=f"CLI.{full_path}"
-        )
-        return replace(config, **{name: normalized})
-
-    child = getattr(config, name)
-    if child is None:
-        raise ConfigResolutionError(
-            f"CLI.{full_path}", "component was not selected by the YAML"
-        )
-    return replace(config, **{name: replace_override_path(child, parts[1:], value, path=full_path)})
+    return replace_override_paths(config, [(parts, value)], path=path)
 
 
 def _resolve_union(node: object, annotation: object, *, path: str) -> object:

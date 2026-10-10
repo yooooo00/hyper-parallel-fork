@@ -34,6 +34,9 @@ class ShardingPlan:
     # {module_fqn: ModuleShardingSpec} — contains only modules with is_boundary=True
     modules: Dict[str, ModuleShardingSpec] = field(default_factory=dict)
 
+    # Family construction and adapter decisions, populated once by the planner.
+    family_modules: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
     # Global switches
     sequence_parallel: bool = True
     loss_parallel: bool = False
@@ -176,6 +179,9 @@ class ShardingPlan:
             f"boundaries: {len(self.modules)}  tied_pairs: "
             + (", ".join(f"{a}<->{b}" for a, b in self.tied_pairs) or "none"),
         ]
+        for name, summary in self.family_modules.items():
+            if fqn is None or name == fqn:
+                lines.append(f"Family [{name}]: {summary}")
         if fqn is not None and fqn not in self.modules:
             lines.append(
                 f"\n[!] {fqn!r} is not a boundary of this plan "

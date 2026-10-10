@@ -44,9 +44,13 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def _projections_can_fuse(projections: tuple[nn.Linear, ...]) -> bool:
     """Return whether projections share the layout needed for fusion."""
     biases = tuple(projection.bias for projection in projections)
+    weight_properties_match = all(
+        len({getattr(projection.weight, attribute) for projection in projections}) == 1
+        for attribute in ("dtype", "device", "requires_grad")
+    )
     return (
         len({projection.in_features for projection in projections}) == 1
-        and len({projection.weight.requires_grad for projection in projections}) == 1
+        and weight_properties_match
         and (all(bias is None for bias in biases) or all(bias is not None for bias in biases))
         and (biases[0] is None or len({bias.requires_grad for bias in biases}) == 1)
     )
@@ -84,8 +88,8 @@ class GQAAttention(nn.Module):
     The source module may expose a fused ``qkv_proj`` or separate
     ``q_proj``/``k_proj``/``v_proj`` layers. Its checkpoint layout is converted
     to the per-KV-head grouping consumed by the high-performance kernel.
-    Construction only creates the target structure; ``make_transforms``
-    declares the checkpoint conversion.
+    Loaded source values are preserved at construction. For meta sources,
+    ``make_transforms`` declares the same reversible checkpoint conversion.
     """
 
     def _initialize_dimensions(self, module: nn.Module) -> None:
@@ -211,7 +215,21 @@ class GQAAttention(nn.Module):
         source_qkv, source_projection_names = self._source_qkv(module)
         self._source_projection_names = source_projection_names
         self._initialize_projections(module, source_qkv)
+        self._copy_loaded_projections(module)
         self.train(module.training)
+
+    def _copy_loaded_projections(self, module: nn.Module) -> None:
+        """Use checkpoint operations for the already-materialized source path."""
+        if self.linear_qkv.weight.is_meta:
+            return
+        source_state = module.state_dict()
+        with torch.no_grad():
+            for transform in self.make_transforms():
+                converted = transform.operations[0].convert(
+                    source_state, transform.source_patterns, transform.target_patterns
+                )
+                for name, value in converted.items():
+                    self.get_parameter(name).copy_(value)
 
     def make_transforms(self) -> list[WeightConverter]:
         """Describe reversible source-checkpoint to high-performance conversion."""
@@ -264,7 +282,19 @@ class GQAAttention(nn.Module):
         actual_seq_len: torch.Tensor | Sequence[int] | None = None,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run GQA with the same external contract as Transformers attention."""
+        """Run GQA with the same external contract as Transformers attention.
+
+        Args:
+            hidden_states: Batch and sequence states to project into grouped QKV.
+            position_embeddings: Rotary cosine and sine tensors, if provided.
+            attention_mask: Causal, padding or custom mask consumed by the kernel.
+            past_key_values: Optional cache following the source model protocol.
+            actual_seq_len: Packed sequence lengths supported by the selected kernel.
+            **kwargs: Additional arguments forwarded to the attention interface.
+
+        Returns:
+            Projected attention output and optional attention weights.
+        """
         input_shape = hidden_states.shape[:-1]
         qkv_states = self.linear_qkv(hidden_states).view(
             *input_shape,
@@ -282,6 +312,14 @@ class GQAAttention(nn.Module):
             query_states = self.q_norm(query_states)
         if self.k_norm is not None:
             key_states = self.k_norm(key_states)
+
+        if hidden_states.numel() == 0:
+            # Empty batches still connect every projection and normalization
+            # parameter to autograd, without invoking attention/RoPE kernels.
+            empty_context = sum(states.sum(dim=(-2, -1))
+                                for states in (query_states, key_states, value_states)).unsqueeze(-1)
+            empty_context = empty_context.expand(*input_shape, self.num_heads * self.v_head_dim)
+            return self.o_proj(empty_context), None
 
         query_states, key_states = _apply_gqa_rope(
             query_states,
@@ -311,7 +349,7 @@ class GQAAttention(nn.Module):
             actual_seq_len=actual_seq_len,
             **kwargs,
         )
-        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output.reshape(*input_shape, self.num_heads * self.v_head_dim).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 

@@ -165,6 +165,9 @@ class ModuleShardingSpec:
         default=None, init=False, repr=False, compare=False,
     )
 
+    _family_adapter_source: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+    _tp_replicated_gradient_contract: bool = field(default=False, init=False, repr=False, compare=False)
+
     # D-22 (rowwise bias defer): planner-computed tuple of bias param paths
     # (relative to the boundary module, e.g. ("o_proj.bias",)) whose addition
     # is deferred until AFTER the boundary exit TP reduction (Megatron

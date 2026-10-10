@@ -24,8 +24,11 @@ for bad tokens, unknown names and type mismatches.
 
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from typing import Dict, Optional
+
+import yaml
 
 from hyper_parallel.trainer.config.parser import parse_training_args
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
@@ -37,6 +40,7 @@ def _sample_model(  # pylint: disable=unused-argument
     *,
     activation: str = "gelu",
     metadata: Optional[Dict[str, str]] = None,
+    activation_fn: Optional[Callable[..., object]] = None,
 ) -> None:
     """Model target whose parameters the override tests rewrite."""
 
@@ -164,6 +168,25 @@ class TestConfigOverrides(unittest.TestCase):
             msg="case: target_replacement_is_rejected",
         ):
             self._parse("--model._target_=other.callable")
+
+    def test_callable_annotation_and_serialization(self) -> None:
+        """Dotted callable arguments survive a full configuration round trip."""
+        config = self._parse(f"--model.activation_fn={__name__}._sample_model")
+        self.assertIs(config.model.activation_fn, _sample_model)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trainer.yaml"
+            path.write_text(yaml.safe_dump(config.to_dict()), encoding="utf-8")
+            restored = parse_training_args([str(path)])
+        self.assertIs(restored.model.activation_fn, _sample_model)
+        with self.assertRaisesRegex(ConfigResolutionError, "expected callable"):
+            self._parse("--model.activation_fn=3")
+
+    def test_target_shorthand_respects_cli_order(self) -> None:
+        """Explicit target paths and shorthand aliases share last-write semantics."""
+        config = self._parse("--optimizer.learning_rate=0.5", "--optimizer.target.learning_rate=0.75")
+        self.assertEqual(config.optimizer.target.learning_rate, 0.75)
+        config = self._parse("--optimizer.target.learning_rate=0.75", "--optimizer.learning_rate=0.5")
+        self.assertEqual(config.optimizer.target.learning_rate, 0.5)
 
     def test_bad_token(self) -> None:
         """A token that is not ``--field=value`` is rejected."""

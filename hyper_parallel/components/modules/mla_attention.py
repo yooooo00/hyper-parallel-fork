@@ -48,8 +48,8 @@ class MLAAttention(nn.Module):
 
     ``q_a_proj`` and ``kv_a_proj_with_mqa`` are fused into ``linear_qkv``.
     Unchanged child modules retain their source names and checkpoint layout.
-    Construction only creates the target structure; ``make_transforms``
-    declares the checkpoint conversion.
+    Loaded projection values are copied during replacement; ``make_transforms``
+    declares the reversible conversion used by the meta loading path.
     """
 
     def __init__(
@@ -146,6 +146,7 @@ class MLAAttention(nn.Module):
         self.linear_qkv.weight.requires_grad_(q_a.weight.requires_grad)
         if q_a.bias is not None:
             self.linear_qkv.bias.requires_grad_(q_a.bias.requires_grad)
+        self._copy_loaded_projections(q_a, kv_a)
 
         self.q_a_layernorm = module.q_a_layernorm
         self.kv_a_layernorm = module.kv_a_layernorm
@@ -154,6 +155,15 @@ class MLAAttention(nn.Module):
         self.o_proj = module.o_proj
 
         self.train(module.training)
+
+    def _copy_loaded_projections(self, q_a: nn.Linear, kv_a: nn.Linear) -> None:
+        """Preserve materialized latent projections when replacing an existing layer."""
+        if q_a.weight.is_meta:
+            return
+        with torch.no_grad():
+            self.linear_qkv.weight.copy_(torch.cat((q_a.weight, kv_a.weight), dim=0))
+            if q_a.bias is not None:
+                self.linear_qkv.bias.copy_(torch.cat((q_a.bias, kv_a.bias), dim=0))
 
     def make_transforms(self) -> list[WeightConverter]:
         """Describe reversible source-checkpoint to high-performance conversion."""

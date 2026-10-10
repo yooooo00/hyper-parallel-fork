@@ -42,6 +42,10 @@ class MXFP8Linear(QuantizedLinearBase):
         self.quantizer = MXFP8Quantizer()
 
     def _apply_low_precision(self, inputs: torch.Tensor) -> torch.Tensor:
+        # No quantization blocks exist for an empty input. Linear's empty
+        # autograd graph retains zero input/weight gradients and child hooks.
+        if inputs.numel() == 0:
+            return nn.functional.linear(inputs, self.weight)  # pylint: disable=not-callable
         return mxfp8_linear(inputs, self.weight, self.quantizer)
 
 

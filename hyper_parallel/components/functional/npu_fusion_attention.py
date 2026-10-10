@@ -202,13 +202,15 @@ def resolve_packed_sequence_lengths(
     return query_lengths, key_lengths
 
 
-def _attention_options(module: torch.nn.Module, kwargs: dict[str, Any]):
+def _attention_options(module: torch.nn.Module, kwargs: dict[str, Any], *, default_next_tokens: int):
     """Resolve sparse-window and causal options from kwargs and the module."""
     pre_tokens = kwargs.get("pre_tokens", getattr(module, "pre_tockens", 1048576))
-    next_tokens = kwargs.get("next_tokens", getattr(module, "next_tockens", 0))
+    next_tokens = kwargs.get("next_tokens", getattr(module, "next_tockens", default_next_tokens))
     sparse_mode = kwargs.get("sparse_mode", getattr(module, "sparse_mode", 0))
     sliding_window = kwargs.get("sliding_window")
-    is_causal = kwargs.get("is_causal", getattr(module, "is_causal", True))
+    is_causal = kwargs.get("is_causal")
+    if is_causal is None:
+        is_causal = getattr(module, "is_causal", True)
     if sliding_window is not None:
         pre_tokens = sliding_window
     return pre_tokens, next_tokens, sparse_mode, sliding_window, is_causal
@@ -256,7 +258,11 @@ def _prepare_fusion_attention_context(
         query.shape[0] * query.shape[2],
         key.shape[0] * key.shape[2],
     )
-    options = _attention_options(module, kwargs)
+    # Rectangular Q/K can represent a CP query shard or cached decoding. Its
+    # explicit mask already uses global positions; a local causal window would
+    # incorrectly suppress keys allowed by that mask.
+    default_next_tokens = 0 if query.shape[2] == key.shape[2] else 1048576
+    options = _attention_options(module, kwargs, default_next_tokens=default_next_tokens)
     prepared = _prepare_attention_inputs(
         query,
         key,

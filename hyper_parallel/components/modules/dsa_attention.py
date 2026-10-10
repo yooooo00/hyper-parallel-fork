@@ -244,6 +244,11 @@ class DeepseekV32DSAAttention(nn.Module):
         self.linear_qkv.weight.requires_grad_(q_a.weight.requires_grad)
         if q_a.bias is not None:
             self.linear_qkv.bias.requires_grad_(q_a.bias.requires_grad)
+        if not q_a.weight.is_meta:
+            with torch.no_grad():
+                self.linear_qkv.weight.copy_(torch.cat((q_a.weight, kv_a.weight), dim=0))
+                if q_a.bias is not None:
+                    self.linear_qkv.bias.copy_(torch.cat((q_a.bias, kv_a.bias), dim=0))
         for name in ("q_a_layernorm", "kv_a_layernorm", "q_b_proj", "kv_b_proj", "o_proj", "indexer"):
             setattr(self, name, getattr(module, name))
 

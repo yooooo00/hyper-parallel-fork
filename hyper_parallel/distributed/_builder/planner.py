@@ -43,7 +43,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from torch import nn
+from torch import nn  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.dtensor.device_mesh import DeviceMesh
 from hyper_parallel.core.dtensor.placement_types import (
@@ -52,6 +52,9 @@ from hyper_parallel.core.dtensor.placement_types import (
     Shard,
 )
 from hyper_parallel.distributed.plan import ShardingPlan
+from hyper_parallel.distributed._builder.module_family import (
+    apply_module_family_defaults, finalize_module_family_summary,
+)
 from hyper_parallel.distributed.recipe_spec import (
     DP,
     TP,
@@ -271,6 +274,7 @@ class ShardingPlanner:
         ep_size: int = 1,
         sequence_parallel: bool = True,
         loss_parallel: bool = False,
+        source_gradient_reduction: bool = False,
         explain: bool = False,
     ) -> ShardingPlan:
         """Derive a ShardingPlan from *model* and *mesh* (6-phase pipeline).
@@ -304,6 +308,9 @@ class ShardingPlanner:
                 sharded across TP (Shard(1) on the ``tp`` axis of activations).
             loss_parallel: When ``True``, lm_head output stays Shard(-1);
                 otherwise gathered to Replicate (cross-entropy compatibility).
+            source_gradient_reduction: Whether HSDP owns source-layout gradient
+                SUM and scaling. Such regions retain partial activation
+                gradients until their declared communication boundary.
             explain: When ``True``, log the plan introspection report
                 (:meth:`ShardingPlan.explain`) at INFO level after planning —
                 per-boundary param sharding, compiled communication plans,
@@ -364,6 +371,10 @@ class ShardingPlanner:
         self._finalize_boundary_specs(
             plan, model, tp_size=tp_size, mesh_dim_names=mesh_dim_names
         )
+
+        apply_module_family_defaults(model, plan, cp_size=cp_size,
+                                     source_gradient_reduction=source_gradient_reduction)
+        finalize_module_family_summary(model, plan, tp_size=tp_size, cp_size=cp_size, ep_size=ep_size)
 
         # D-14 invariants (05 §13.2/§13.3): full self-declaration + param
         # uniqueness (the only nesting check that remains)

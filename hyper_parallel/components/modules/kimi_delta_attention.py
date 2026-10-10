@@ -400,6 +400,26 @@ def torch_chunk_kda(
     This implementation is algebraically independent from
     :func:`torch_recurrent_kda`; comparing the two catches errors in the
     chunk transform that a second token loop would hide.
+
+    Args:
+        query: Query states with shape ``[B, S, H_k, K]``.
+        key: Key states with the same layout as query.
+        value: Value states with shape ``[B, S, H_v, V]``.
+        gate: Per-channel log decays, or logits when gate activation is requested.
+        beta: Per-value-head update strengths, or logits when sigmoid is requested.
+        a_log: Per-head log scale required by gate activation.
+        dt_bias: Per-channel bias required by gate activation.
+        scale: Optional query scale; defaults to the inverse square root of key width.
+        initial_state: Optional incoming state with shape ``[B, H_v, K, V]``.
+        output_final_state: Whether to return the final state alongside the output.
+        use_qk_l2norm_in_kernel: Normalize query and key before the chunk computation.
+        use_gate_in_kernel: Convert gate logits into negative log decays.
+        use_beta_sigmoid_in_kernel: Apply sigmoid to beta before the state update.
+        lower_bound: Optional negative lower bound for the gate parameterization.
+        chunk_size: Positive number of tokens per chunk, with zero padding at the end.
+
+    Returns:
+        Token outputs and the optional final state.
     """
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
@@ -450,12 +470,14 @@ def torch_chunk_kda(
         torch.eye(chunk_size, dtype=torch.bool, device=query.device)
     )
 
+    # Mask before exp: discarded future-token decays can overflow, and masking
+    # their products afterwards leaves inf * 0 in the gate backward pass.
     gate_pair = gate.unsqueeze(-2) - gate.unsqueeze(-3)
     key_pair = torch.einsum(
         "...ik,...jk,...ijk->...ij",
         key,
         key,
-        gate_pair.exp(),
+        gate_pair.masked_fill(~strict_causal.unsqueeze(-1), float("-inf")).exp(),
     )
     strict_lower = (
         key_pair * beta.unsqueeze(-1)
@@ -485,7 +507,7 @@ def torch_chunk_kda(
             "bhik,bhjk,bhijk->bhij",
             query_i,
             key_i,
-            relative_gate.exp(),
+            relative_gate.masked_fill(~causal.unsqueeze(-1), float("-inf")).exp(),
         ).masked_fill(~causal, 0)
         value_new = u_i - w_i @ state
         output_inter = (query_i * gate_i.exp()) @ state
@@ -657,6 +679,24 @@ def torch_kda_state_summary(
     ``[B, HV, K, K]``. Query is accepted to share KDA input preprocessing and
     grouped-value validation; the state transition itself is independent of
     query and output scale.
+
+    Args:
+        query: Query states with shape ``[B, S, H_k, K]``.
+        key: Key states with the same layout as query.
+        value: Value states with shape ``[B, S, H_v, V]``.
+        gate: Per-channel log decays, or logits when gate activation is requested.
+        beta: Per-value-head update strengths, or logits when sigmoid is requested.
+        a_log: Per-head log scale required by gate activation.
+        dt_bias: Per-channel bias required by gate activation.
+        scale: Optional query scale; defaults to the inverse square root of key width.
+        use_qk_l2norm_in_kernel: Normalize query and key before the chunk computation.
+        use_gate_in_kernel: Convert gate logits into negative log decays.
+        use_beta_sigmoid_in_kernel: Apply sigmoid to beta before the state update.
+        lower_bound: Optional negative lower bound for the gate parameterization.
+        chunk_size: Positive number of tokens per chunk, with zero padding at the end.
+
+    Returns:
+        State-independent contribution ``S`` and the transition matrix ``M``.
     """
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
@@ -688,12 +728,14 @@ def torch_kda_state_summary(
         dtype=torch.bool,
         device=key.device,
     ).tril(diagonal=-1)
+    # Mask before exp: discarded future-token decays can overflow, and masking
+    # their products afterwards leaves inf * 0 in the gate backward pass.
     gate_pair = gate.unsqueeze(-2) - gate.unsqueeze(-3)
     key_pair = torch.einsum(
         "...ik,...jk,...ijk->...ij",
         key,
         key,
-        gate_pair.exp(),
+        gate_pair.masked_fill(~strict_causal.unsqueeze(-1), float("-inf")).exp(),
     )
     strict_lower = (key_pair * beta.unsqueeze(-1)).masked_fill(
         ~strict_causal,

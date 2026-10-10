@@ -219,8 +219,8 @@ def bind_local_expert_forward(
         fqn = getattr(experts, "module_fqn", "experts")
         if not use_grouped_gemm:
             raise ValueError(f"{fqn}: selected MXFP8 experts require grouped compute; explicit False is unsupported")
-        if ep_size not in (1, 2):
-            raise NotImplementedError(f"{fqn}: MXFP8 experts support only EP=1 or EP=2")
+        if ep_size not in (1, 2, 4):
+            raise NotImplementedError(f"{fqn}: MXFP8 experts support only EP=1, 2 or 4")
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:
         raise ValueError(

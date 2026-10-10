@@ -29,11 +29,12 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Protocol, Sequence, Tuple
 
-import torch
+import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.core.dtensor.dtensor import DTensor
 from hyper_parallel.core.dtensor.placement_types import Partial, Placement, Shard
 from hyper_parallel.distributed.recipe_spec import resolve_placements
+from hyper_parallel.distributed._builder.tp_region_gradients import region_gradient_operation
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,11 @@ def _classify_collective(src, dst) -> str:
     diff_src = tuple(s for s, d in zip(src, dst) if s != d)
     diff_dst = tuple(d for s, d in zip(src, dst) if s != d)
 
+    return _classify_changed_placements(diff_src, diff_dst)
+
+
+def _classify_changed_placements(diff_src, diff_dst) -> str:
+    """Classify only the mesh axes that need redistribution."""
     has_shard_src = any(isinstance(p, Shard) for p in diff_src)
     has_partial_src = any(isinstance(p, Partial) for p in diff_src)
     has_shard_dst = any(isinstance(p, Shard) for p in diff_dst)
@@ -123,6 +129,18 @@ class RedistOp:
             tensor: input local tensor (or DTensor).
             as_dtensor: True → return a DTensor (validate mode), False → return a local tensor.
         """
+        if getattr(self.execution_op, "preserves_layout", False) is True:
+            if isinstance(tensor, DTensor):
+                if tuple(tensor.placements) != self.src_placements:
+                    raise ValueError(
+                        f"TP region expected input placements {self.src_placements}, got {tensor.placements}"
+                    )
+                local = tensor.to_local()
+            else:
+                local = tensor
+            result = self.execution_op.execute(local)
+            return DTensor.from_local(result, self.mesh, self.dst_placements) if as_dtensor else result
+
         if self.collective_type == "identity":
             if isinstance(tensor, DTensor):
                 # validate (as_dtensor=True) keeps the DTensor; production
@@ -181,6 +199,16 @@ class PrecompiledBoundary:
         """Delegate optional execution lowering without owning backend details."""
         return self._op_lowerer(src, dst) if self._op_lowerer is not None else None
 
+    def _region_gradient_op(self, src, dst, *, input_side):
+        """Apply only the planner-declared replicated-gradient region contract."""
+        if getattr(self.spec, "_tp_replicated_gradient_contract", False):
+            operation = region_gradient_operation(
+                self.mesh, self.mesh_dim_names, src, dst, input_side=input_side
+            )
+            if operation is not None:
+                return operation
+        return self._lower_execution_op(src, dst)
+
     # ── Compilation ─────────────────────────────────────────────────────
 
     def _compile_input_plan(self, spec, mesh, mesh_dim_names):
@@ -203,7 +231,7 @@ class PrecompiledBoundary:
                 src_placements=src_p,
                 dst_placements=dst_p,
                 collective_type=_classify_collective(src_p, dst_p),
-                execution_op=self._lower_execution_op(src_p, dst_p),
+                execution_op=self._region_gradient_op(src_p, dst_p, input_side=True),
             ))
         return plan
 
@@ -237,7 +265,7 @@ class PrecompiledBoundary:
                 src_placements=src_p,
                 dst_placements=dst_p,
                 collective_type=_classify_collective(src_p, dst_p),
-                execution_op=self._lower_execution_op(src_p, dst_p),
+                execution_op=self._region_gradient_op(src_p, dst_p, input_side=False),
             ))
         return plan
 

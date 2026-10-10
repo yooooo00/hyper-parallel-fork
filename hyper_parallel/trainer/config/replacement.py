@@ -16,7 +16,7 @@
 
 from typing import Any, Callable
 
-from hyper_parallel.components.modules.family import resolve_module_family_target
+from hyper_parallel.components.modules.family import bind_module_family, resolve_module_family_target
 from hyper_parallel.trainer.config.target import Target
 
 
@@ -30,6 +30,12 @@ class ReplacementTarget(Target):
                           if name in ("use_mxfp8", "use_fused_mxfp8")}
         resolved, arguments = resolve_module_family_target(_target_, kwargs)
         super().__init__(resolved, target_path=target_path, **arguments)
+
+    def build(self, **runtime_kwargs: Any) -> Any:
+        """Construct the implementation and retain its Family identity for planning."""
+        module = super().build(**runtime_kwargs)
+        bind_module_family(module, self.requested_target, self.selectors)
+        return module
 
     def replace(self, **changes: Any) -> "ReplacementTarget":
         """Re-resolve selectors after an override, without mutating the original."""

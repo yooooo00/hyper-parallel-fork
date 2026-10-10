@@ -231,9 +231,11 @@ class ModuleFamilyTests(unittest.TestCase):
             setattr(model.mlp.experts, field, value)
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, "mlp.experts"):
                 replace_experts(model, family_config(use_mxfp8=True))
-        for axis in ("tp", "cp", "pp"):
+        for axis in ("pp",):
             with self.subTest(axis=axis), self.assertRaisesRegex(NotImplementedError, "mlp.experts"):
                 replace_experts(TinyMoE(), family_config(use_mxfp8=True), context={axis: True})
+        with self.assertRaisesRegex(NotImplementedError, "mlp.experts.*EP=1, 2 or 4"):
+            replace_experts(TinyMoE(), family_config(use_mxfp8=True), context={"ep": True, "ep_size": 8})
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -297,6 +299,30 @@ class ModuleFamilyTests(unittest.TestCase):
                         self.assertEqual(calls, [1])
                         self.assertEqual(experts.local_expert_count, 2)
                         self.assertIsNotNone(x.grad)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_grouped_binder_supported_expert_sizes(self):
+        """
+        Feature: Grouped expert recipe capability validation.
+        Description: Build the selected MXFP8 recipe for EP sizes two, four and eight.
+        Expectation: Supported sizes derive local experts; EP=8 fails with the module FQN.
+        """
+        factory_path = "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn"
+        raw = family_config(use_mxfp8=True).to_dict()
+        raw["plan_overrides"].append({"match": "mlp", "local_compute_fn": {"_target_": factory_path}})
+        config = resolve_config(raw)
+        target = config.plan_overrides[-1].local_compute_fn
+        for size in (2, 4, 8):
+            model, mesh = TinyMoE(), FakeEpMesh()
+            replace_experts(model, config)
+            with self.subTest(ep_size=size), patch.object(mesh, "size", return_value=size):
+                if size == 8:
+                    with self.assertRaisesRegex(NotImplementedError, "mlp.experts.*EP=1, 2 or 4"):
+                        target.build(module=model.mlp, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=mesh)
+                else:
+                    target.build(module=model.mlp, mesh=None, tp_mesh=None, cp_mesh=None, ep_mesh=mesh)
+                    self.assertEqual(model.mlp.experts.local_expert_count, 4 // size)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
@@ -381,6 +407,9 @@ assert 'hyper_parallel.components.modules.mxfp8_grouped_swiglu' not in sys.modul
         spec._ep_size = 2
         plan = ShardingPlan(modules={"mlp": spec})
         validate_module_family_plan(model, plan, mesh, ep_mesh, validate_mode=False)
+        with patch.object(ep_mesh, "size", return_value=8):
+            with self.assertRaisesRegex(NotImplementedError, "mlp.experts.*EP=1, 2 or 4"):
+                validate_module_family_plan(model, plan, mesh, ep_mesh, validate_mode=False)
         with self.assertRaisesRegex(NotImplementedError, "mlp.experts.*production"):
             validate_module_family_plan(model, plan, mesh, ep_mesh, validate_mode=True)
         for placement in (Shard(1), Replicate()):

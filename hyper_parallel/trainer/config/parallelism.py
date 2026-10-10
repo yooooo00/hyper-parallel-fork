@@ -171,7 +171,7 @@ class PlanOverride:
     replace_module: Optional[Target[Any]] = None
     local_compute_fn: Optional[Target[Any]] = None
     inner_target: Optional[str] = None
-    inner_wrapper: Optional[Union[str, Target[Any]]] = None
+    inner_wrapper: Optional[Union[str, bool, Target[Any]]] = None
     inner_out_src: Optional[Any] = None
     region_dispatch: Optional[bool] = None
     params: Optional[Any] = None

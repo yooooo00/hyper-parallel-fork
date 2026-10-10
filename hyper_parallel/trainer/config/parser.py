@@ -28,7 +28,7 @@ import yaml
 
 from hyper_parallel.trainer.config.resolver import (
     ConfigResolutionError,
-    replace_override_path,
+    replace_override_paths,
     resolve_config,
 )
 from hyper_parallel.trainer.config.trainer import TrainerConfig
@@ -59,7 +59,7 @@ def _apply_typed_overrides(
     overrides: Sequence[str],
 ) -> TrainerConfig:
     """Parse CLI override values and apply them to the resolved configuration."""
-    config_with_overrides = config
+    parsed_overrides = []
     for dot_path, raw_value in _parse_override_tokens(overrides):
         try:
             parsed_value = yaml.safe_load(raw_value)
@@ -67,10 +67,8 @@ def _apply_typed_overrides(
             raise ConfigResolutionError(
                 f"CLI.{dot_path}", f"invalid YAML value {raw_value!r}: {exc}"
             ) from exc
-        config_with_overrides = replace_override_path(
-            config_with_overrides, dot_path.split("."), parsed_value, path=""
-        )
-    return config_with_overrides
+        parsed_overrides.append((dot_path.split("."), parsed_value))
+    return replace_override_paths(config, parsed_overrides)
 
 
 def _load_training_config(
