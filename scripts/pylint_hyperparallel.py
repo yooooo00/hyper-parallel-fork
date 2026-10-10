@@ -17,16 +17,28 @@
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
+import re
 from typing import Any, Iterable, Optional, Tuple
 
 from astroid import nodes
 from pylint.checkers import BaseChecker
 
 APACHE_HEADER_SNIPPETS: Tuple[str, ...] = (
-    "Copyright 2026 Huawei Technologies Co., Ltd",
-    "Licensed under the Apache License, Version 2.0",
+    'Licensed under the Apache License, Version 2.0 (the "License");',
+    "you may not use this file except in compliance with the License.",
+    "You may obtain a copy of the License at",
+    "http://www.apache.org/licenses/LICENSE-2.0",
+    "Unless required by applicable law or agreed to in writing, software",
+    'distributed under the License is distributed on an "AS IS" BASIS,',
+    "WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.",
+    "See the License for the specific language governing permissions and",
     "limitations under the License.",
+)
+COPYRIGHT_HEADER_PATTERN = re.compile(
+    r"^# Copyright (?:\(c\) )?(?P<start>[12][0-9]{3})(?:-(?P<end>[12][0-9]{3}))? [A-Za-z0-9].*$",
+    re.MULTILINE,
 )
 BACKEND_IMPORTS = {"torch"}
 PLATFORM_ALLOWED_PARTS = ("tests/", "scripts/", ".agent/")
@@ -230,8 +242,21 @@ class HyperParallelChecker(BaseChecker):
             content = file_path.read_text(encoding="utf-8")
         except OSError:
             return
-        header_window = "\n".join(content.splitlines()[:16])
-        if all(snippet in header_window for snippet in APACHE_HEADER_SNIPPETS):
+        header_lines = []
+        for line in content.splitlines()[:16]:
+            if line.strip() and not line.startswith("#"):
+                break
+            header_lines.append(line)
+        header_window = "\n".join(header_lines)
+        copyright_match = COPYRIGHT_HEADER_PATTERN.search(header_window)
+        if copyright_match is None:
+            self.add_message("missing-apache-license-header", node=node)
+            return
+        start = int(copyright_match["start"])
+        end = int(copyright_match["end"] or start)
+        valid_years = start <= end <= date.today().year
+        comment_lines = {line.removeprefix("#").strip() for line in header_lines}
+        if valid_years and all(snippet in comment_lines for snippet in APACHE_HEADER_SNIPPETS):
             return
         self.add_message("missing-apache-license-header", node=node)
 
