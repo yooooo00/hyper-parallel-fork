@@ -14,9 +14,15 @@
 # ============================================================================
 """Replacement-only Target retaining family selectors for Python/CLI overrides."""
 
+from __future__ import annotations
+
 from typing import Any, Callable
 
-from hyper_parallel.components.modules.family import resolve_module_family_target
+from hyper_parallel.components.modules.family import (
+    SelectorSpec,
+    get_family_selector_specs,
+    resolve_module_family_target,
+)
 from hyper_parallel.trainer.config.target import Target
 
 
@@ -24,15 +30,36 @@ class ReplacementTarget(Target):
     """Resolve the implementation without discarding the requested baseline."""
 
     def __init__(self, _target_: Callable, *, target_path: str, **kwargs: Any) -> None:
-        """Select a final callable and strictly validate constructor keywords."""
+        """Select a final callable and strictly validate constructor keywords.
+
+        Args:
+            _target_: Requested baseline or ordinary replacement callable.
+            target_path: Original import path retained in serialized configuration.
+            **kwargs: Explicit selectors and constructor arguments.
+        """
         self.requested_target = _target_
-        self.selectors = {name: value for name, value in kwargs.items()
-                          if name in ("use_mxfp8", "use_fused_mxfp8")}
+        selector_specs = get_family_selector_specs(_target_)
+        self.selectors = {name: value for name, value in kwargs.items() if name in selector_specs}
         resolved, arguments = resolve_module_family_target(_target_, kwargs)
         super().__init__(resolved, target_path=target_path, **arguments)
 
+    def get_family_selector_spec(self, name: str) -> SelectorSpec | None:
+        """Query the requested baseline's schema for Target-level overrides.
+
+        Args:
+            name: Selector name supplied by the override path.
+
+        Returns:
+            Its declaration, or None when it is not a selector for this target.
+        """
+        return get_family_selector_specs(self.requested_target).get(name)
+
     def replace(self, **changes: Any) -> "ReplacementTarget":
-        """Re-resolve selectors after an override, without mutating the original."""
+        """Re-resolve selectors after an override, without mutating the original.
+
+        Args:
+            **changes: Explicit selectors or constructor arguments to replace.
+        """
         return type(self)(self.requested_target, target_path=self._target_path,
                           **{**self._kwargs, **self.selectors, **changes})
 

@@ -343,8 +343,9 @@ def _replace_target_path(
             f"CLI.{full_path}", "changing _target_ through an override is not supported"
         )
 
-    if isinstance(config, ReplacementTarget) and name in ("use_mxfp8", "use_fused_mxfp8"):
-        normalized = normalize_value(value, bool, path=f"CLI.{full_path}")
+    selector_spec = config.get_family_selector_spec(name) if isinstance(config, ReplacementTarget) else None
+    if selector_spec is not None:
+        normalized = normalize_value(value, selector_spec.value_type, path=f"CLI.{full_path}")
         return config.replace(**{name: normalized})
 
     signature = inspect.signature(config.callable)
