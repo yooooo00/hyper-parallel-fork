@@ -14,7 +14,10 @@
 # ============================================================================
 """CPU tests for grouped-linear strategy dispatch and shared autograd."""
 
+from __future__ import annotations
+
 import unittest
+from typing import Any
 from unittest import mock
 
 import torch
@@ -49,16 +52,27 @@ cpu_test = arg_mark(
 
 
 class _DenseStorage:
-    """Minimal directional storage carrying high-precision CPU data."""
+    """Directional CPU storage implementing the saved-operand protocol."""
 
-    def __init__(self, value, *, rowwise, colwise):
-        self.value = value
-        self.rowwise = rowwise
-        self.colwise = colwise
+    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype, *, quantizer: Any = None,
+                 row_data: torch.Tensor | None = None, row_scale: torch.Tensor | None = None,
+                 col_data: torch.Tensor | None = None, col_scale: torch.Tensor | None = None) -> None:
+        """Retain the physical buffers used by the CPU arithmetic double."""
+        self.shape, self.dtype, self.quantizer = shape, dtype, quantizer
+        self.row_data, self.row_scale = row_data, row_scale
+        self.col_data, self.col_scale = col_data, col_scale
 
-    def update_usage(self, rowwise=True, colwise=True):
-        self.rowwise = self.rowwise and rowwise
-        self.colwise = self.colwise and colwise
+    @property
+    def value(self) -> torch.Tensor:
+        """Return the retained arithmetic buffer."""
+        return self.row_data if self.row_data is not None else self.col_data
+
+    def update_usage(self, rowwise: bool = True, colwise: bool = True) -> None:
+        """Release spent directional buffers."""
+        if not rowwise:
+            self.row_data = self.row_scale = None
+        if not colwise:
+            self.col_data = self.col_scale = None
 
 
 class _DenseGroupedLinear(GroupedLinear):
@@ -66,30 +80,43 @@ class _DenseGroupedLinear(GroupedLinear):
 
     FORMAT_NAME = "DenseTest"
 
-    def normalize_group_list(self, group_list, group_list_type):
+    def normalize_group_list(self, group_list: torch.Tensor, group_list_type: int) -> tuple[torch.Tensor, int]:
+        """Keep the supplied grouping representation."""
         return group_list, group_list_type
 
-    def output_features(self, weight):
+    def output_features(self, weight: torch.Tensor) -> int:
+        """Read the output width from the live weight layout."""
         return weight.shape[-2]
 
-    def weight_quantization_directions(self, needs_grad_input):
+    def weight_quantization_directions(self, needs_grad_input: bool) -> tuple[bool, bool]:
+        """Follow the MXFP8 directional contract."""
         return needs_grad_input, True
 
-    def retain_weight_backward(self, weight_quant, needs_grad_input):
+    def retain_weight_backward(self, weight_quant: _DenseStorage, needs_grad_input: bool) -> None:
+        """Keep the weight direction needed by dgrad."""
         weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
 
     @staticmethod
     def _store(value, rowwise, colwise):
-        return _DenseStorage(value, rowwise=rowwise, colwise=colwise)
+        return _DenseStorage(
+            value.shape, value.dtype,
+            row_data=value if rowwise else None, row_scale=torch.ones(1) if rowwise else None,
+            col_data=value if colwise else None, col_scale=torch.ones(1) if colwise else None,
+        )
 
-    def quantize_input(self, inputs, *, rowwise, colwise, **kwargs):
+    def quantize_input(self, inputs: torch.Tensor, *, rowwise: bool, colwise: bool, **kwargs: Any) -> _DenseStorage:
+        """Store inputs without introducing device arithmetic."""
         del kwargs
         return self._store(inputs, rowwise, colwise)
 
-    def quantize_weight(self, weight, *, rowwise, colwise):
+    def quantize_weight(self, weight: torch.Tensor, *, rowwise: bool, colwise: bool) -> _DenseStorage:
+        """Store weights under the same directional protocol."""
         return self._store(weight, rowwise, colwise)
 
-    def quantize_grad_output(self, grad_output, *, rowwise, colwise, **kwargs):
+    def quantize_grad_output(
+        self, grad_output: torch.Tensor, *, rowwise: bool, colwise: bool, **kwargs: Any,
+    ) -> _DenseStorage:
+        """Store upstream gradients for dgrad and wgrad."""
         del kwargs
         return self._store(grad_output, rowwise, colwise)
 
@@ -103,15 +130,16 @@ class _DenseGroupedLinear(GroupedLinear):
 
     def grouped_matmul(
         self,
-        left,
-        right,
+        left: _DenseStorage,
+        right: _DenseStorage,
         *,
-        layout,
-        group_list,
-        group_type,
-        group_list_type,
-        output_dtype,
-    ):
+        layout: str,
+        group_list: torch.Tensor,
+        group_type: int,
+        group_list_type: int,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Execute dense grouped arithmetic using the retained directions."""
         del group_type
         counts = self._counts(group_list, group_list_type)
         left_parts = left.value.split(counts, dim=0)
@@ -153,9 +181,13 @@ class TestStrategyFactory(unittest.TestCase):
             mock.patch(f"{module}.validate_fake_w4a8_gmm_runtime"),
         )
 
-    @cpu_test
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_dispatches_w8a8_native_w4a8_and_fake_w4a8(self):
-        """All three supported policies choose their independent strategies."""
+        """Feature: grouped linear.
+        Description: All three supported policies choose their independent strategies.
+        Expectation: declared output, gradients or errors are preserved.
+        """
         aligned32 = ((2, 64, 32), (2, 32, 64))
         aligned128 = ((2, 256, 128), (2, 128, 256))
         p_mx, p_native, p_fake = self._patch_probes()
@@ -185,9 +217,13 @@ class TestStrategyFactory(unittest.TestCase):
         native_probe.assert_called_once_with()
         fake_probe.assert_called_once_with()
 
-    @cpu_test
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_alignment_and_unsupported_policies_fail_at_factory(self):
-        """Bad tiles and unimplemented family combinations fail before replacement."""
+        """Feature: grouped linear.
+        Description: Bad tiles and unimplemented family combinations fail before replacement.
+        Expectation: declared output, gradients or errors are preserved.
+        """
         module = "hyper_parallel.components.quantization.functional.strategy_factory"
         with mock.patch(f"{module}.validate_w4a8_gmm_runtime"):
             with self.assertRaisesRegex(ValueError, "not aligned"):
@@ -212,9 +248,13 @@ class TestStrategyFactory(unittest.TestCase):
 class TestGroupedLinearLifecycle(unittest.TestCase):
     """The shared autograd bridge preserves dense forward/dgrad/wgrad semantics."""
 
-    @cpu_test
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_forward_and_both_gradients_match_dense_reference(self):
-        """Live [E,O,K] weights are transposed only at the GMM seam."""
+        """Feature: grouped linear.
+        Description: Live [E,O,K] weights are transposed only at the GMM seam.
+        Expectation: declared output, gradients or errors are preserved.
+        """
         torch.manual_seed(7)
         counts = torch.tensor([2, 3], dtype=torch.int64)
         inputs = torch.randn(5, 4, dtype=torch.float64, requires_grad=True)
@@ -235,9 +275,13 @@ class TestGroupedLinearLifecycle(unittest.TestCase):
         torch.testing.assert_close(actual_grads[0], expected_grads[0])
         torch.testing.assert_close(actual_grads[1], expected_grads[1])
 
-    @cpu_test
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_empty_input_has_shaped_output_and_zero_gradients(self):
-        """Experts receiving zero total tokens remain valid in forward/backward."""
+        """Feature: grouped linear.
+        Description: Experts receiving zero total tokens remain valid in forward/backward.
+        Expectation: declared output, gradients or errors are preserved.
+        """
         inputs = torch.empty(0, 4, requires_grad=True)
         weight = torch.randn(2, 6, 4, requires_grad=True)
         counts = torch.tensor([0, 0], dtype=torch.int64)
@@ -251,9 +295,13 @@ class TestGroupedLinearLifecycle(unittest.TestCase):
         torch.testing.assert_close(inputs.grad, torch.zeros_like(inputs))
         torch.testing.assert_close(weight.grad, torch.zeros_like(weight))
 
-    @cpu_test
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_shared_shape_and_group_validation(self):
-        """Malformed geometry is rejected consistently for every strategy."""
+        """Feature: grouped linear.
+        Description: Malformed geometry is rejected consistently for every strategy.
+        Expectation: declared output, gradients or errors are preserved.
+        """
         inputs = torch.randn(3, 4)
         weight = torch.randn(2, 6, 4)
         groups = torch.tensor([1, 2])

@@ -27,6 +27,11 @@ from typing import Optional
 
 import torch  # pylint: disable=forbidden-backend-import
 
+from hyper_parallel.components.quantization.functional._saved_quantized import (
+    pack_quantized_operands,
+    unpack_quantized_operands,
+)
+
 from hyper_parallel.components.quantization.tensor import (
     QuantizedTensor,
     QuantizedTensorStorage,
@@ -58,18 +63,30 @@ class GroupedLinear(ABC):
         or cumulative offsets (``group_list_type=0``). MXFP8 accepts either
         representation; W4A8 normalizes counts to cumulative offsets and
         leaves existing offsets unchanged.
+
+        Args:
+            group_list: Per-expert counts or cumulative offsets.
+            group_list_type: One for counts, zero for cumulative offsets.
         """
 
     @abstractmethod
     def output_features(self, weight: torch.Tensor) -> int:
-        """Return the output width ``O`` in the live ``[E, O, K]`` layout."""
+        """Return the output width ``O`` in the live ``[E, O, K]`` layout.
+
+        Args:
+            weight: Packed expert weights in live [E, O, K] layout.
+        """
 
     @abstractmethod
     def weight_quantization_directions(
         self,
         needs_grad_input: bool,
     ) -> tuple[bool, bool]:
-        """Return the row/column weight views needed for forward and dgrad."""
+        """Return the row/column weight views needed for forward and dgrad.
+
+        Args:
+            needs_grad_input: Whether backward must compute an input gradient.
+        """
 
     @abstractmethod
     def retain_weight_backward(
@@ -83,6 +100,10 @@ class GroupedLinear(ABC):
         kept), transposed column-wise for W4A8 (``colwise`` kept).  The
         input/gradient views are released inline in the template instead,
         because no native format varies them.
+
+        Args:
+            weight_quant: Quantized weight whose forward-only direction can be released.
+            needs_grad_input: Whether backward must compute an input gradient.
         """
 
     @abstractmethod
@@ -95,7 +116,15 @@ class GroupedLinear(ABC):
         group_list: torch.Tensor,
         group_list_type: int,
     ) -> QuantizedTensor:
-        """Create the format-specific activation representation."""
+        """Create the format-specific activation representation.
+
+        Args:
+            inputs: Input activations in token-major order.
+            rowwise: Whether to prepare row-wise storage.
+            colwise: Whether to prepare column-wise storage.
+            group_list: Per-expert counts or cumulative offsets.
+            group_list_type: One for counts, zero for cumulative offsets.
+        """
 
     @abstractmethod
     def quantize_weight(
@@ -105,7 +134,13 @@ class GroupedLinear(ABC):
         rowwise: bool,
         colwise: bool,
     ) -> QuantizedTensor:
-        """Create the format-specific weight representation."""
+        """Create the format-specific weight representation.
+
+        Args:
+            weight: Packed expert weights in live [E, O, K] layout.
+            rowwise: Whether to prepare row-wise storage.
+            colwise: Whether to prepare column-wise storage.
+        """
 
     @abstractmethod
     def quantize_grad_output(
@@ -117,7 +152,15 @@ class GroupedLinear(ABC):
         group_list: torch.Tensor,
         group_list_type: int,
     ) -> QuantizedTensor:
-        """Create the format-specific gradient-output representation."""
+        """Create the format-specific gradient-output representation.
+
+        Args:
+            grad_output: Upstream gradient in token-major order.
+            rowwise: Whether to prepare row-wise storage.
+            colwise: Whether to prepare column-wise storage.
+            group_list: Per-expert counts or cumulative offsets.
+            group_list_type: One for counts, zero for cumulative offsets.
+        """
 
     @abstractmethod
     def grouped_matmul(
@@ -131,7 +174,17 @@ class GroupedLinear(ABC):
         group_list_type: int,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Execute one format-specific grouped matrix multiplication."""
+        """Execute one format-specific grouped matrix multiplication.
+
+        Args:
+            left: Left quantized operand.
+            right: Right quantized operand.
+            layout: GMM transpose convention.
+            group_list: Per-expert counts or cumulative offsets.
+            group_type: GMM grouping dimension.
+            group_list_type: One for counts, zero for cumulative offsets.
+            output_dtype: Logical output dtype.
+        """
 
     def forward(
         self,
@@ -141,7 +194,15 @@ class GroupedLinear(ABC):
         group_list: torch.Tensor,
         group_list_type: int,
     ) -> torch.Tensor:
-        """Run the complete forward lifecycle using this strategy's hooks."""
+        """Run the complete forward lifecycle using this strategy's hooks.
+
+        Args:
+            ctx: Autograd context for this projection.
+            inputs: Input activations in token-major order.
+            weight: Packed expert weights in live [E, O, K] layout.
+            group_list: Per-expert counts or cumulative offsets.
+            group_list_type: One for counts, zero for cumulative offsets.
+        """
 
         # 共享校验门禁——live [E,O,K] 几何/group 不变量，
         # 错误前缀取 FORMAT_NAME
@@ -164,11 +225,12 @@ class GroupedLinear(ABC):
         ctx.weight_shape = weight.shape
         ctx.weight_dtype = weight.dtype
         ctx.weight_device = weight.device
-        ctx.group_list = effective_group_list
         ctx.group_list_type = effective_group_list_type
         ctx.strategy = self
         ctx.empty_input = inputs.shape[0] == 0
         if ctx.empty_input:
+            ctx.quantized_metadata = ()
+            ctx.save_for_backward(group_list, effective_group_list)
             # abstract: 给出输出宽 O，空输入也能产出 (0,O)
             return inputs.new_empty((0, self.output_features(weight)))
 
@@ -206,12 +268,17 @@ class GroupedLinear(ABC):
             output_dtype=inputs.dtype,
         )
 
-        ctx.input_quant = input_quant if needs_grad_weight else None
-        ctx.weight_quant = weight_quant if needs_grad_input else None
         # The forward view is spent; keep only the direction backward needs.
         input_quant.update_usage(rowwise=False, colwise=needs_grad_weight)
         # hook: 只保留 dgrad 需要的 weight 方向——W4A8 覆写
         self.retain_weight_backward(weight_quant, needs_grad_input)
+        ctx.quantized_metadata, buffers = pack_quantized_operands((
+            input_quant if needs_grad_weight else None,
+            weight_quant if needs_grad_input else None,
+        ))
+        # Keep both source counts and normalized offsets under autograd version
+        # checks, even when normalization allocated a separate tensor.
+        ctx.save_for_backward(group_list, effective_group_list, *buffers)
         return output
 
     def backward(
@@ -219,8 +286,15 @@ class GroupedLinear(ABC):
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Run the complete dgrad/wgrad lifecycle using this strategy's hooks."""
+        """Run the complete dgrad/wgrad lifecycle using this strategy's hooks.
 
+        Args:
+            ctx: Autograd context for this projection.
+            grad_output: Upstream gradient in token-major order.
+        """
+
+        saved = ctx.saved_tensors
+        group_list = saved[1]
         needs_grad_input = ctx.needs_input_grad[0]
         needs_grad_weight = ctx.needs_input_grad[1]
         if ctx.empty_input:
@@ -244,12 +318,13 @@ class GroupedLinear(ABC):
             )
             return grad_input, grad_weight
 
+        input_quant, weight_quant = unpack_quantized_operands(ctx.quantized_metadata, saved[2:])
         # abstract: 量化 grad_output，保留 backward 需要的两个方向
         grad_quant = self.quantize_grad_output(
             grad_output,
             rowwise=needs_grad_input,
             colwise=needs_grad_weight,
-            group_list=ctx.group_list,
+            group_list=group_list,
             group_list_type=ctx.group_list_type,
         )
         grad_input = None
@@ -258,9 +333,9 @@ class GroupedLinear(ABC):
             # abstract: dgrad——grad_output × 保留的 weight（NT）
             grad_input = self.grouped_matmul(
                 grad_quant,
-                ctx.weight_quant,
+                weight_quant,
                 layout="NT",
-                group_list=ctx.group_list,
+                group_list=group_list,
                 group_type=0,
                 group_list_type=ctx.group_list_type,
                 output_dtype=ctx.input_dtype,
@@ -268,10 +343,10 @@ class GroupedLinear(ABC):
         if needs_grad_weight:
             # abstract: wgrad——保留的 input × grad_output（TN，得 [E,K,O]）
             grad_weight = self.grouped_matmul(
-                ctx.input_quant,
+                input_quant,
                 grad_quant,
                 layout="TN",
-                group_list=ctx.group_list,
+                group_list=group_list,
                 group_type=2,
                 group_list_type=ctx.group_list_type,
                 output_dtype=ctx.weight_dtype,
@@ -281,8 +356,6 @@ class GroupedLinear(ABC):
             grad_weight = grad_weight.transpose(-2, -1).contiguous()
 
         grad_quant.update_usage(rowwise=False, colwise=False)
-        ctx.input_quant = None
-        ctx.weight_quant = None
         return grad_input, grad_weight
 
 
@@ -295,7 +368,16 @@ def validate_grouped_linear_inputs(
     weight_input_dim: int,
     name: str,
 ) -> None:
-    """Validate shape and grouping invariants shared by native formats."""
+    """Validate shape and grouping invariants shared by native formats.
+
+    Args:
+        inputs: Input activations in token-major order.
+        weight: Packed expert weights in live [E, O, K] layout.
+        group_list: Per-expert counts or cumulative offsets.
+        group_list_type: One for counts, zero for cumulative offsets.
+        weight_input_dim: Weight dimension contracting with the input.
+        name: Strategy name used in error messages.
+    """
 
     if inputs.ndim != 2:
         raise ValueError(
@@ -345,7 +427,16 @@ class _GroupedLinearFunction(torch.autograd.Function):
         strategy: GroupedLinear,
         group_list_type: int,
     ) -> torch.Tensor:
-        """Delegate the complete forward lifecycle to the strategy."""
+        """Delegate the complete forward lifecycle to the strategy.
+
+        Args:
+            ctx: Autograd context for this projection.
+            inputs: Input activations in token-major order.
+            weight: Packed expert weights in live [E, O, K] layout.
+            group_list: Per-expert counts or cumulative offsets.
+            strategy: Format-specific grouped-linear strategy.
+            group_list_type: One for counts, zero for cumulative offsets.
+        """
 
         return strategy.forward(
             ctx,
@@ -356,6 +447,7 @@ class _GroupedLinearFunction(torch.autograd.Function):
         )
 
     @staticmethod
+    @torch.autograd.function.once_differentiable
     def backward(
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
@@ -366,7 +458,12 @@ class _GroupedLinearFunction(torch.autograd.Function):
         None,
         None,
     ]:
-        """Delegate the complete backward lifecycle to the strategy."""
+        """Delegate the complete backward lifecycle to the strategy.
+
+        Args:
+            ctx: Autograd context for this projection.
+            grad_output: Upstream gradient in token-major order.
+        """
 
         grad_input, grad_weight = ctx.strategy.backward(ctx, grad_output)
         return grad_input, grad_weight, None, None, None
