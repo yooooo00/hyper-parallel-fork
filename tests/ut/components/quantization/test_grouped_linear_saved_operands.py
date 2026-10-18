@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +26,7 @@ from torch.utils.checkpoint import checkpoint
 
 from hyper_parallel.components.quantization.functional.base_gmm_func import _GroupedLinearFunction
 from hyper_parallel.components.quantization.tensor import MXFP8Tensor, W4A8Tensor
+from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import MXFP8GroupedLinear
 from tests.ut.components.quantization.functional.test_grouped_linear import _DenseGroupedLinear
 from tests.common.mark_utils import arg_mark
 
@@ -150,3 +152,20 @@ class TestGroupedLinearSavedOperands(unittest.TestCase):
                         for value, reference, ac_value in zip(actual, expected, recomputed):
                             torch.testing.assert_close(value, reference, rtol=0, atol=0)
                             torch.testing.assert_close(ac_value, reference, rtol=0, atol=0)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_mxfp8_row_only_quantization_omits_group_metadata(self) -> None:
+        """Feature: Frozen-weight MXFP8 directional quantization.
+        Description: Request row-only input and gradient storage from the real strategy.
+        Expectation: Group metadata is supplied only when the column direction is requested.
+        """
+        quantizer = Mock()
+        strategy = MXFP8GroupedLinear(quantizer)
+        counts = torch.tensor([2, 0, 3])
+        value = torch.randn(5, 4)
+        for method in (strategy.quantize_input, strategy.quantize_grad_output):
+            for colwise in (False, True):
+                with self.subTest(method=method.__name__, colwise=colwise):
+                    method(value, rowwise=True, colwise=colwise, group_list=counts, group_list_type=1)
+                    self.assertIs(quantizer.quantize.call_args.kwargs["group_list"], counts if colwise else None)
