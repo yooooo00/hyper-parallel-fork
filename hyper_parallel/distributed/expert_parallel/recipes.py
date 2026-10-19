@@ -86,6 +86,8 @@ The factory must RETURN the compute fn
 tensors inside the local-region skeleton.
 """
 
+from __future__ import annotations
+
 from typing import Any, Callable, Optional
 
 import torch
@@ -142,9 +144,9 @@ def build_ep_compute(
     *,
     router_fn: Callable,
     archetype_key: str,
-    expected_attrs,
+    expected_attrs: list[str],
     combine: Callable,
-    use_grouped_gemm: bool = False,
+    use_grouped_gemm: bool | None = None,
     capacity_factor: Optional[float] = None,
     overlap_fn: Optional[Callable] = None,
 ) -> Callable:
@@ -167,19 +169,20 @@ def build_ep_compute(
     ``models/qwen3_moe/adapter/distributed/expert_parallel.py``) compose
     their EP archetype on top of this skeleton while the router adapters and
     dispatch primitives stay in this generic layer.
+
+    Args:
+        module: Model-specific MoE boundary.
+        ep_mesh: Effective expert mesh used for parameter sharding.
+        router_fn: Existing model-specific router adapter.
+        archetype_key: Name used in contract diagnostics.
+        expected_attrs: Required attributes on the boundary.
+        combine: Existing model-specific output composition.
+        use_grouped_gemm: None for automatic selection, or an explicit bool.
     """
     ep_group = _require_ep_group(ep_mesh, f"archetype '{archetype_key}'")
     _require_moe_interface(module, expected_attrs, archetype_key)
-    if use_grouped_gemm:
-        bind_local_expert_forward(
-            module,
-            ep_mesh["ep"].size(),
-            use_grouped_gemm=True,
-        )
-    else:
-        # Keep the established call contract unchanged for every reference
-        # archetype and for Qwen3 when grouped GEMM is disabled.
-        bind_local_expert_forward(module, ep_mesh["ep"].size())
+    bind_local_expert_forward(
+        module, ep_mesh["ep"].size(), use_grouped_gemm=use_grouped_gemm)
 
     if capacity_factor is not None:
         # Read back by ``experts._resolve_capacity_factor``; bounds each expert's routed slots
