@@ -34,6 +34,7 @@ This module is a thin public facade: the implementation lives in
 from typing import Any, Optional, Tuple
 
 from hyper_parallel.distributed.plan import ShardingPlan
+from hyper_parallel.distributed._builder.module_family import validate_module_family_plan
 from hyper_parallel.distributed.recipe_spec import (
     _normalize_out_fields,
 )
@@ -120,9 +121,13 @@ def apply_sharding_plan(
       experts from the expert mesh);
     - validate: no unwrap (parameters remain DTensors); source_shard_info is None.
     """
+    full_mesh = getattr(mesh, "device_mesh", mesh)
     mesh, models, expert_mesh, dense_source_mesh, expert_source_mesh = (
         _prepare_sharding_meshes(model, plan, mesh)
     )
+
+    for part in models:
+        validate_module_family_plan(part, plan, full_mesh, expert_mesh, validate_mode=validate_mode)
 
     # ====== Phase 0: normalize out_src/out_dst scalar shorthand (idempotent, covers user-injected paths) ======
     for spec in plan.modules.values():

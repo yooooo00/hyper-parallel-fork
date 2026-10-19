@@ -14,6 +14,8 @@
 # ============================================================================
 """MXFP8 format hooks for the shared native grouped-linear flow."""
 
+from __future__ import annotations
+
 import torch  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.quantization.functional.base_gmm_func import (
@@ -26,6 +28,7 @@ from hyper_parallel.components.quantization.quantizers import (
     MXFP8Quantizer,
 )
 from hyper_parallel.components.quantization.tensor import (
+    QuantizedTensor,
     QuantizedTensorStorage,
 )
 
@@ -41,6 +44,7 @@ class MXFP8GroupedLinear(GroupedLinear):
         self.quantizer = quantizer if quantizer is not None else MXFP8Quantizer()
 
     def output_features(self, weight: torch.Tensor) -> int:
+        """Return the live weight output dimension."""
         return weight.shape[-2]
 
     def normalize_group_list(
@@ -48,6 +52,7 @@ class MXFP8GroupedLinear(GroupedLinear):
         group_list: torch.Tensor,
         group_list_type: int,
     ) -> tuple[torch.Tensor, int]:
+        """Keep counts or offsets as supported by MXFP8 GMM."""
         # MXFP8's operator accepts per-expert token counts as-is.
         return group_list, group_list_type
 
@@ -55,6 +60,7 @@ class MXFP8GroupedLinear(GroupedLinear):
         self,
         needs_grad_input: bool,
     ) -> tuple[bool, bool]:
+        """Request forward and, when needed, dgrad weight directions."""
         # MXFP8 weights use the column-wise representation for forward GMM
         # and the row-wise representation for dgrad.
         return needs_grad_input, True
@@ -64,6 +70,7 @@ class MXFP8GroupedLinear(GroupedLinear):
         weight_quant: QuantizedTensorStorage,
         needs_grad_input: bool,
     ) -> None:
+        """Release the forward-only column direction."""
         weight_quant.update_usage(rowwise=needs_grad_input, colwise=False)
 
     def quantize_input(
@@ -74,10 +81,11 @@ class MXFP8GroupedLinear(GroupedLinear):
         colwise: bool,
         group_list: torch.Tensor,
         group_list_type: int,
-    ):
+    ) -> QuantizedTensor:
+        """Quantize inputs; only the column direction uses expert boundaries."""
         return self.quantizer.quantize(
             inputs,
-            group_list=group_list,
+            group_list=group_list if colwise else None,
             group_list_type=group_list_type,
             rowwise=rowwise,
             colwise=colwise,
@@ -89,7 +97,8 @@ class MXFP8GroupedLinear(GroupedLinear):
         *,
         rowwise: bool,
         colwise: bool,
-    ):
+    ) -> QuantizedTensor:
+        """Quantize GMM-ready expert weights in the requested directions."""
         return self.quantizer.quantize(
             weight,
             rowwise=rowwise,
@@ -104,10 +113,11 @@ class MXFP8GroupedLinear(GroupedLinear):
         colwise: bool,
         group_list: torch.Tensor,
         group_list_type: int,
-    ):
+    ) -> QuantizedTensor:
+        """Quantize gradients, grouping only when wgrad needs column storage."""
         return self.quantizer.quantize(
             grad_output,
-            group_list=group_list,
+            group_list=group_list if colwise else None,
             group_list_type=group_list_type,
             rowwise=rowwise,
             colwise=colwise,
@@ -115,8 +125,8 @@ class MXFP8GroupedLinear(GroupedLinear):
 
     def grouped_matmul(
         self,
-        left,
-        right,
+        left: QuantizedTensor,
+        right: QuantizedTensor,
         *,
         layout: str,
         group_list: torch.Tensor,
@@ -124,6 +134,7 @@ class MXFP8GroupedLinear(GroupedLinear):
         group_list_type: int,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Lower one projection to the MXFP8 GMM adapter."""
         return mxfp8_grouped_matmul(
             left,
             right,

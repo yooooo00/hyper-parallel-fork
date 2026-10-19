@@ -42,17 +42,9 @@ def save_quantized_operands(
         weight: Weight operand needed for the input gradient, or None.
         group_list: Group boundaries or counts for grouped projections.
     """
-    metadata = []
-    tensors = [group_list]
-    for operand in (inputs, weight):
-        if operand is None:
-            metadata.append(None)
-            tensors.extend((None,) * _BUFFERS_PER_OPERAND)
-        else:
-            metadata.append((type(operand), tuple(operand.shape), operand.dtype, operand.quantizer))
-            tensors.extend((operand.row_data, operand.row_scale, operand.col_data, operand.col_scale))
-    ctx.quantized_metadata = tuple(metadata)
-    ctx.save_for_backward(*tensors)
+    metadata, tensors = pack_quantized_operands((inputs, weight))
+    ctx.quantized_metadata = metadata
+    ctx.save_for_backward(group_list, *tensors)
 
 
 def restore_quantized_operands(
@@ -67,17 +59,50 @@ def restore_quantized_operands(
         Grouping tensor, input operand and weight operand, in that order.
     """
     tensors = ctx.saved_tensors
+    operands = unpack_quantized_operands(ctx.quantized_metadata, tensors[_GROUP_LIST_SLOTS:])
+    return tensors[0], operands[0], operands[1]
+
+
+def pack_quantized_operands(operands: tuple) -> tuple[tuple, list[Optional[torch.Tensor]]]:
+    """Separate any number of quantized operands into metadata and physical buffers.
+
+    Args:
+        operands: Quantized wrappers or None slots in a stable operand order.
+
+    Returns:
+        Reconstruction metadata and four physical tensor slots per operand.
+    """
+    metadata, tensors = [], []
+    for operand in operands:
+        if operand is None:
+            metadata.append(None)
+            tensors.extend((None,) * _BUFFERS_PER_OPERAND)
+        else:
+            metadata.append((type(operand), tuple(operand.shape), operand.dtype, operand.quantizer))
+            tensors.extend((operand.row_data, operand.row_scale, operand.col_data, operand.col_scale))
+    return tuple(metadata), tensors
+
+
+def unpack_quantized_operands(metadata: tuple, tensors: tuple) -> tuple:
+    """Rebuild wrappers from restored physical tensors without consuming their storage.
+
+    Args:
+        metadata: Reconstruction metadata produced by pack_quantized_operands.
+        tensors: Restored row data/scale and column data/scale slots.
+
+    Returns:
+        Fresh wrappers or None, in the original operand order.
+    """
     operands = []
-    for index, metadata in enumerate(ctx.quantized_metadata):
-        if metadata is None:
+    for index, entry in enumerate(metadata):
+        if entry is None:
             operands.append(None)
             continue
-        tensor_type, shape, dtype, quantizer = metadata
-        # Skip the grouping prefix and the buffers of preceding operands.
-        offset = _GROUP_LIST_SLOTS + _BUFFERS_PER_OPERAND * index
+        tensor_type, shape, dtype, quantizer = entry
+        offset = _BUFFERS_PER_OPERAND * index
         row_data, row_scale, col_data, col_scale = tensors[offset:offset + _BUFFERS_PER_OPERAND]
         operands.append(tensor_type(
             shape, dtype, quantizer=quantizer,
             row_data=row_data, row_scale=row_scale, col_data=col_data, col_scale=col_scale,
         ))
-    return tensors[0], operands[0], operands[1]
+    return tuple(operands)

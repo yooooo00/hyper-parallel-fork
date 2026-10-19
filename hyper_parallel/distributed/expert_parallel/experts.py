@@ -32,6 +32,8 @@ Nothing in this module probes model structure with getattr fallback chains.
 Split out of components/distributed/ep_utils.py in stage 4e.
 """
 
+from __future__ import annotations
+
 import logging
 import math
 import os
@@ -103,6 +105,10 @@ def resolve_swiglu_weights(
     w_down = w_down if w_down is not None else getattr(experts, "down_projs", None)
     w_down = w_down if w_down is not None else getattr(experts, "w2", None)
     if w_fused is not None and w_down is not None:
+        if getattr(experts, "is_transposed", False):
+            # Canonical GroupedExperts stores [E,in,out]; F.linear consumes [E,out,in].
+            w_fused = w_fused.transpose(-2, -1)
+            w_down = w_down.transpose(-2, -1)
         return w_fused, None, w_down
 
     w_gate = getattr(experts, "gate_proj", None)
@@ -306,7 +312,7 @@ def _get_global_expert_count(module):
 def bind_local_expert_forward(
     module: Any,
     ep_size: int,
-    use_grouped_gemm: bool = False,
+    use_grouped_gemm: bool | None = None,
     apply_gate: Optional[Callable] = None,
 ) -> None:
     """Install the local expert compute entry used by TP-extend-EP.
@@ -315,9 +321,26 @@ def bind_local_expert_forward(
     time: sets ``module.experts.local_expert_count`` and installs
     ``experts.forward`` (via the forward rewriter's bound-forward install
     point) so nested FSDP hooks unshard/reshard around the local SwiGLU
-    computation. ``apply_gate`` supplies model-specific fused gate/up
-    semantics when the default activation-times-up rule is insufficient.
+    computation. ``apply_gate`` supplies model-specific gate/up semantics.
+
+    Args:
+        module: MoE boundary holding the final expert module.
+        ep_size: Effective EP group size.
+        use_grouped_gemm: None selects by capability; explicit False is rejected
+            by grouped-only variants.
+        apply_gate: Optional model-specific gate activation for eager compute.
     """
+    experts = module.experts
+    if use_grouped_gemm is not None and not isinstance(use_grouped_gemm, bool):
+        raise TypeError("use_grouped_gemm must be None, True or False")
+    if use_grouped_gemm is None:
+        use_grouped_gemm = callable(getattr(experts, "forward_expert_major", None))
+    if getattr(experts, "requires_grouped_expert_compute", False):
+        fqn = getattr(experts, "module_fqn", "experts")
+        if not use_grouped_gemm:
+            raise ValueError(f"{fqn}: selected MXFP8 experts require grouped compute; explicit False is unsupported")
+        if ep_size not in (1, 2):
+            raise NotImplementedError(f"{fqn}: MXFP8 experts support only EP=1 or EP=2")
     global_expert_count = _get_global_expert_count(module)
     if global_expert_count % ep_size != 0:
         raise ValueError(
