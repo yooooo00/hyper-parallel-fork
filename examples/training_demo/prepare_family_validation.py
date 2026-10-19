@@ -71,6 +71,8 @@ def prepare(output_dir: Path) -> None:
     base["dataset"]["model_assets"]["tokenizer"]["pretrained_model_name_or_path"] = str(assets)
     base["dataset"]["data_path"] = str(output_dir / "text.jsonl")
     base["dataset"]["data_transform"]["max_seq_len"] = 64
+    # Keep one source sample per micro-batch so train_iters counts real updates.
+    base["dataloader"]["token_budget"] = 1
     base["optimizer"] = {
         "_target_": "hyper_parallel.components.optim.AdamW",
         "adamw_config": {"adamw_lr": 0.0001, "adamw_weight_decay": 0.01,

@@ -99,6 +99,15 @@ class ObservedTextTrainer(TextTrainer):
              "local_gate_up_shape": list(_local(expert.gate_up_proj).shape)}
             for name, expert in self.experts]}), flush=True)
 
+    def train(self) -> None:
+        """Reject an exhausted data source that did not complete the requested updates."""
+        super().train()
+        if self.base.state.global_step != self.base.train_iters:
+            raise RuntimeError(
+                f"Trainer completed {self.base.state.global_step} updates; "
+                f"expected {self.base.train_iters}."
+            )
+
     def _gradient_hook(self, name):
         def observe(gradient: torch.Tensor) -> None:
             """Check and record the gradient without changing it.
