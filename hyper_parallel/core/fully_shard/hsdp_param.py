@@ -960,7 +960,7 @@ class HSDPParamV2:
         actual_shard_length = self.sharded_size[shard_dim]
         if self.sharded_size == self.padded_sharded_param_size:
             local_tensor = local_tensor.contiguous()
-            self._sharded_param_data = local_tensor.view(-1)
+            self._sharded_param_data = local_tensor.view(-1).detach()
             local_view = local_tensor
         else:
             padded_local_tensor = local_tensor.new_zeros(self.padded_sharded_param_size)
@@ -972,12 +972,14 @@ class HSDPParamV2:
                     0,
                     actual_shard_length,
                 ).copy_(local_tensor)
-            self._sharded_param_data = padded_local_tensor.view(-1)
+            self._sharded_param_data = padded_local_tensor.view(-1).detach()
             local_view = padded_local_tensor.narrow(
                 shard_dim,
                 0,
                 actual_shard_length,
             )
+        # local_view becomes trainable below; communication storage must share
+        # its bytes without inheriting its autograd view relationship.
         set_requires_grad_if_needed(self.sharded_param, local_view)
         self.sharded_param._local_tensor = local_view
         self._update_shardedparam_storage_forcely()
