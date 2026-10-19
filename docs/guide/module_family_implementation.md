@@ -319,3 +319,10 @@ ctx 的其它属性仅保留形状、dtype、设备、策略和重建元数据�
 [ep]: ../../hyper_parallel/distributed/expert_parallel/experts.py
 [parallel]: ../../hyper_parallel/distributed/_builder/module_family.py
 [fusion]: ../../hyper_parallel/components/quantization/functional/mxfp8_fused_grouped_swiglu.py
+
+## 主线参数物化兼容
+
+HSDP 在参数从 meta 设备物化或恢复存储时，通信缓冲区必须是脱离 autograd 的 Tensor。
+`_refresh_sharded_local_tensor()` 对展平后的通信视图执行 `detach()`，继续与可训练的本地参数共享存储，
+但不保留其 autograd 视图关系。这样参数同步或更新后，首次和后续 unshard 都能复用稳定的 Parameter，
+同时正常计算梯度。该修复适用于主线 HSDP，不依赖 Module Family。
