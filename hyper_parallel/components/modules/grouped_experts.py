@@ -498,12 +498,15 @@ register_module_family(ModuleFamily(
     name="grouped_experts",
     baseline=GroupedExperts,
     variants={
+        "qat": "hyper_parallel.components.modules.qat_grouped_experts.QATGroupedExperts",
         "mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.MXFP8GroupedSwiGLU",
         "fused_mxfp8": "hyper_parallel.components.modules.mxfp8_grouped_swiglu.FusedMXFP8GroupedSwiGLU",
     },
-    selector_specs={"use_mxfp8": SelectorSpec(bool, False), "use_fused_mxfp8": SelectorSpec(bool, False)},
+    selector_specs={"use_mxfp8": SelectorSpec(bool, False), "use_fused_mxfp8": SelectorSpec(bool, False),
+                    "use_low_precision": SelectorSpec(bool, False)},
     variant_rules=(
-        VariantRule({"use_mxfp8": True, "use_fused_mxfp8": False}, "mxfp8"),
-        VariantRule({"use_mxfp8": True, "use_fused_mxfp8": True}, "fused_mxfp8"),
+        VariantRule({"use_mxfp8": False, "use_fused_mxfp8": False, "use_low_precision": True}, "qat"),
+        VariantRule({"use_mxfp8": True, "use_fused_mxfp8": False, "use_low_precision": False}, "mxfp8"),
+        VariantRule({"use_mxfp8": True, "use_fused_mxfp8": True, "use_low_precision": False}, "fused_mxfp8"),
     ),
 ))
