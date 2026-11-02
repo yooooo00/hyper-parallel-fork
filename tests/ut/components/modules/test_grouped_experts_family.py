@@ -79,13 +79,29 @@ class TestGroupedExpertsFamily(unittest.TestCase):
         Expectation: Unsupported contexts fail with the module FQN during replacement.
         """
         for fused in (False, True):
-            for axis in ("tp", "cp", "pp"):
-                for ep in (False, True):
-                    context = {axis: True, "ep": ep}
-                    with self.subTest(fused=fused, context=context):
-                        with self.assertRaisesRegex(NotImplementedError, "mlp.experts"):
-                            replace_experts(TinyMoE(), family_config(
-                                use_mxfp8=True, use_fused_mxfp8=fused), context=context)
+            for context in ({"tp": True}, {"cp": True}, {"cp": True, "ep": True},
+                            {"pp": True}, {"pp": True, "ep": True}):
+                with self.subTest(fused=fused, context=context):
+                    with self.assertRaisesRegex(NotImplementedError, "mlp.experts"):
+                        replace_experts(TinyMoE(), family_config(
+                            use_mxfp8=True, use_fused_mxfp8=fused), context=context)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_tp_ep_selection_preserves_weights(self) -> None:
+        """
+        Feature: Model TP with MXFP8 expert parallelism.
+        Description: Replace loaded experts with TP and EP active together.
+        Expectation: Both variants retain complete expert matrices before planner EP sharding.
+        """
+        for fused, expected in ((False, MXFP8GroupedSwiGLU), (True, FusedMXFP8GroupedSwiGLU)):
+            with self.subTest(fused=fused):
+                model = TinyMoE(canonical=True)
+                parameters = tuple(model.mlp.experts.parameters())
+                replace_experts(model, family_config(use_mxfp8=True, use_fused_mxfp8=fused),
+                                context={"tp": True, "ep": True})
+                self.assertIs(type(model.mlp.experts), expected)
+                for before, after in zip(parameters, model.mlp.experts.parameters()):
+                    self.assertIs(before, after)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_meta_and_canonical_weights(self) -> None:

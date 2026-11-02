@@ -49,6 +49,8 @@ class MXFP8GroupedSwiGLU(GroupedExperts):
         EP recipes must explicitly set ``use_grouped_gemm: true`` to call this
         module's MXFP8 computation. Omitting it or setting it to false uses the
         existing eager expert path, which bypasses MXFP8 computation.
+        Model TP is supported with EP, which keeps each local expert's matrices
+        complete. Tensor sharding within an individual expert is not supported.
     """
 
     def __init__(self, *, module: nn.Module, module_fqn: str = "",
@@ -57,8 +59,10 @@ class MXFP8GroupedSwiGLU(GroupedExperts):
         context = context or {}
         self.module_fqn = module_fqn
         prefix = f"{module_fqn or '<root>'}: MXFP8GroupedSwiGLU"
-        if any(context.get(axis) for axis in ("tp", "cp", "pp")):
-            raise NotImplementedError(f"{prefix} requires TP=CP=PP=1")
+        if context.get("cp") or context.get("pp"):
+            raise NotImplementedError(f"{prefix} requires CP=PP=1")
+        if context.get("tp") and not context.get("ep"):
+            raise NotImplementedError(f"{prefix} requires EP>1 when TP is enabled")
         try:
             super().__init__(module=module, module_fqn=module_fqn, context=context)
         except (ValueError, TypeError, KeyError) as exc:
