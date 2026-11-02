@@ -39,7 +39,7 @@ _EP_FACTORY = "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parall
 _STEPS = ("balanced", "empty_experts", "empty_rank")
 
 
-def _build_model(source, fused, device):
+def _build_model(source, fused, device, cp_size=1):
     """Apply replacement and real planner sharding without manually slicing weights."""
     raw = family_config(use_mxfp8=True, use_fused_mxfp8=fused).to_dict()
     raw["plan_overrides"].append({
@@ -48,7 +48,8 @@ def _build_model(source, fused, device):
             "_target_": _EP_FACTORY, "use_grouped_gemm": True}},
     })
     config = resolve_config(raw)
-    mesh = MeshContext(dp_size=2, dp_replicate_size=2, ep_size=2)
+    mesh = MeshContext(dp_size=2 // cp_size, dp_replicate_size=2,
+                       cp_size=cp_size, ep_size=2, sequence_parallel=cp_size > 1)
     mesh.build_meshs("npu", 2)
     setup = DistributedSetup(mesh_context=mesh)
     normalize_distributed_setup_overrides(setup, config)
@@ -234,11 +235,13 @@ def _run_training(model, reference, ops, device, fused):
 
 
 @pytest.mark.parametrize("fused", [False, True])
-def test_family_mxfp8_ep(fused: bool) -> None:
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_family_mxfp8_ep(fused: bool, cp_size: int) -> None:
     """Train both MXFP8 implementations through the EP=2 model builder.
 
     Args:
         fused: Whether to select the fused MXFP8 Family variant.
+        cp_size: Context degree; CP tokens use the same existing expert dispatch.
     """
     device, backend = _device()
     if not dist.is_initialized():
@@ -249,7 +252,7 @@ def test_family_mxfp8_ep(fused: bool) -> None:
     unsharded = copy.deepcopy(source)
     replace_experts(unsharded, family_config())
     reference = unsharded.mlp.experts
-    model = _build_model(source, fused, device)
+    model = _build_model(source, fused, device, cp_size=cp_size)
     ops = CountingMXOps(backend)
     model.mlp.experts.quantizer = MXFP8Quantizer(npu_ops=ops)
     _check_partition(model.mlp.experts, reference, dist.get_rank())

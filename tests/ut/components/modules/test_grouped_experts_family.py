@@ -79,13 +79,31 @@ class TestGroupedExpertsFamily(unittest.TestCase):
         Expectation: Unsupported contexts fail with the module FQN during replacement.
         """
         for fused in (False, True):
-            for axis in ("tp", "cp", "pp"):
+            for axis in ("tp", "pp"):
                 for ep in (False, True):
                     context = {axis: True, "ep": ep}
                     with self.subTest(fused=fused, context=context):
                         with self.assertRaisesRegex(NotImplementedError, "mlp.experts"):
                             replace_experts(TinyMoE(), family_config(
                                 use_mxfp8=True, use_fused_mxfp8=fused), context=context)
+
+    @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
+    def test_cp_selection_preserves_weights(self) -> None:
+        """
+        Feature: MXFP8 context parallelism.
+        Description: Replace loaded experts with CP active, with and without EP.
+        Expectation: Both variants retain full hidden/intermediate dimensions and parameter identity.
+        """
+        for fused, expected in ((False, MXFP8GroupedSwiGLU), (True, FusedMXFP8GroupedSwiGLU)):
+            for ep in (False, True):
+                with self.subTest(fused=fused, ep=ep):
+                    model = TinyMoE(canonical=True)
+                    parameters = tuple(model.mlp.experts.parameters())
+                    replace_experts(model, family_config(use_mxfp8=True, use_fused_mxfp8=fused),
+                                    context={"cp": True, "ep": ep})
+                    self.assertIs(type(model.mlp.experts), expected)
+                    for before, after in zip(parameters, model.mlp.experts.parameters()):
+                        self.assertIs(before, after)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0", card_mark="onecard", essential_mark="essential")
     def test_meta_and_canonical_weights(self) -> None:

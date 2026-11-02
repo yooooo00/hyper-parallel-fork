@@ -57,8 +57,8 @@ class MXFP8GroupedSwiGLU(GroupedExperts):
         context = context or {}
         self.module_fqn = module_fqn
         prefix = f"{module_fqn or '<root>'}: MXFP8GroupedSwiGLU"
-        if any(context.get(axis) for axis in ("tp", "cp", "pp")):
-            raise NotImplementedError(f"{prefix} requires TP=CP=PP=1")
+        if any(context.get(axis) for axis in ("tp", "pp")):
+            raise NotImplementedError(f"{prefix} requires TP=PP=1")
         try:
             super().__init__(module=module, module_fqn=module_fqn, context=context)
         except (ValueError, TypeError, KeyError) as exc:
