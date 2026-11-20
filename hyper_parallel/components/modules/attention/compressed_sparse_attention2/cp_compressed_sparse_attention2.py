@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import Any
@@ -258,7 +258,9 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
     def __init__(self, module: torch.nn.Module | None = None, *, config: Any = None, layer_idx: int = 0,
                  replace_indexer: bool = True, use_fused_ops: bool = False,
                  indexer_load_balance: str = "none", main_kv_comm: str = "all_gather",
-                 indexer_balance_block_size: int | None = None, indexer_zigzag_min_length: int | None = None) -> None:
+                 indexer_balance_block_size: int | None = None, indexer_zigzag_min_length: int | None = None,
+                 linear_dtype_scheme: str | None = None,
+                 linear_exclude_patterns: Sequence[str] = ("o_a_proj", "indexer.weights_proj")) -> None:
         """Adopt mathematical children and choose CP stages without creating parameters."""
         indexer_balance_block_size = resolve_indexer_balance_block_size(
             indexer_load_balance, indexer_balance_block_size,
@@ -272,6 +274,8 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
         self.main_kv_comm = main_kv_comm
         self.indexer_balance_block_size = indexer_balance_block_size
         self.indexer_zigzag_min_length = indexer_zigzag_min_length
+        self.linear_dtype_scheme = linear_dtype_scheme
+        self.linear_exclude_patterns = tuple(linear_exclude_patterns)
         if self.is_index_source:
             self.indexer = _CPIndexer(self.indexer, apply_rope=_apply_v41_rope)
             self.indexer.balance_mode = indexer_load_balance
@@ -279,6 +283,10 @@ class CPCompressedSparseAttention2(_TPCompressedSparseAttention2):
             self.indexer.zigzag_min_length = indexer_zigzag_min_length
         if self.is_kv_source and isinstance(getattr(self, "compressor", None), CSA2Compressor):
             self.compressor = _CPCompressor.from_module(self.compressor)
+
+    def _encode_raw_kv(self, key_value: torch.Tensor) -> torch.Tensor:
+        """Keep local raw K=V floating before cross-rank halo exchange."""
+        return key_value
 
     def bind_parallel(self, binding: Any) -> None:
         """Bind all stages to the framework-owned CP context and optional TP group."""

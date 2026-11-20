@@ -28,6 +28,9 @@ from hyper_parallel.components.functional.sparse_flash_mla import (
     supports_fused_attention_inputs, sparse_flash_mla,
 )
 from hyper_parallel.components.modules.rms_norm import RMSNorm
+from hyper_parallel.components.quantization.functional.main_kv_cache_qat import MainKVCacheQATStrategy
+from hyper_parallel.components.quantization.functional.swa_kv_qat import SWAKVQATStrategy
+from hyper_parallel.components.quantization.tensor.csa2_cache_tensor import CSA2CacheTensor
 from hyper_parallel.core.activation_memory.recompute_state import is_recomputing
 from .compressor import CSA2Compressor
 from .document_layout import SharedCompressedPackedSequence
@@ -124,12 +127,13 @@ class SharedCompressedAttentionState:
 
     def require_index_key(self, source_layer: int | None, consumer_layer: int) -> torch.Tensor:
         """Read the Indexer key associated with a compressed-KV source."""
-        return self._require(
+        value = self._require(
             self.index_key_by_source,
             source_layer,
             "Indexer key",
             consumer_layer,
         )
+        return value.dequantize() if isinstance(value, CSA2CacheTensor) else value
 
     def publish_topk_indices(self, source_layer: int, value: torch.Tensor) -> bool:
         """Publish one Full/Reindex layer's token selection."""
@@ -348,8 +352,22 @@ class CompressedSparseAttention2Module(nn.Module):
         self.use_fused_ops = use_fused_ops
         if self.is_index_source:
             self.indexer.use_fused = use_fused_ops
+        self._kv_qat_strategy: MainKVCacheQATStrategy | None = getattr(module, "_kv_qat_strategy", None)
+        self._swa_kv_qat_strategy: SWAKVQATStrategy | None = getattr(module, "_swa_kv_qat_strategy", None)
         # Children are adopted by identity; preserve their individual training modes.
         self.training = module.training
+
+    def set_kv_qat_strategy(self, strategy: MainKVCacheQATStrategy) -> None:
+        """Bind the Main KV QAT strategy applied once at the compressor output."""
+        self._kv_qat_strategy = strategy
+
+    def set_swa_kv_qat_strategy(self, strategy: SWAKVQATStrategy) -> None:
+        """Bind the local SWA KV packer."""
+        self._swa_kv_qat_strategy = strategy
+
+    def _encode_raw_kv(self, key_value: torch.Tensor) -> torch.Tensor:
+        """Pack the local raw K=V bank when a single-card SWA strategy is bound."""
+        return self._swa_kv_qat_strategy.pack(key_value) if self._swa_kv_qat_strategy is not None else key_value
 
     def head_reducer(self) -> Callable | None:
         """Keep local head sums; parallel members provide the complete-head reduction."""
@@ -363,7 +381,7 @@ class CompressedSparseAttention2Module(nn.Module):
     def _project_raw_kv(self, hidden_states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         """Project and rotate the local raw K=V rows."""
         key_value = self.kv_norm(self.kv_proj(hidden_states)).unsqueeze(1)
-        return _apply_v41_rope(key_value, cos, sin)
+        return self._encode_raw_kv(_apply_v41_rope(key_value, cos, sin))
 
     def _project_query(
             self,
@@ -518,7 +536,9 @@ class CompressedSparseAttention2Module(nn.Module):
         key_value = self._project_raw_kv(hidden_states, cos, sin)
         qr, query = self._project_query(hidden_states, cos, sin)
         latent, compressed = self.compress_key_value(hidden_states, embeddings, plan, key_positions)
-        if compressed is not None:
+        if compressed is not None and not is_recomputing():
+            if self._kv_qat_strategy is not None:
+                compressed = self._kv_qat_strategy.pack(compressed)
             shared_state.publish_compressed_kv(self.layer_idx, compressed)
         indexed = self._run_indexer(hidden_states, qr, latent, embeddings, shared_state, document,
                                     block_plan=plan, key_position_embeddings=key_positions)
@@ -575,7 +595,11 @@ class CompressedSparseAttention2Module(nn.Module):
             causal_upper=document.causal_upper,
         )
         if self.indexer.owns_key:
-            shared_state.publish_index_key(self.layer_idx, indexer_output.index_key)
+            shared_state.publish_index_key(
+                self.layer_idx,
+                indexer_output.index_key_cache if indexer_output.index_key_cache is not None
+                else indexer_output.index_key,
+            )
         shared_state.publish_topk_indices(self.layer_idx, indexer_output.topk_indices)
         if indexer_output.candidate_blocks is not None:
             shared_state.publish_candidate_blocks(
@@ -677,6 +701,10 @@ class CompressedSparseAttention2Module(nn.Module):
                     f"ratio={self.compress_ratio}, window={self.sliding_window}. "
                     "Check the SMLA training extension and native input contract; no reference fallback was run."
                 )
+        key_value = key_value.dequantize() if isinstance(key_value, CSA2CacheTensor) else key_value
+        compressed_kv = (compressed_kv.dequantize() if isinstance(compressed_kv, CSA2CacheTensor)
+                         else compressed_kv)
+        if self.use_fused_ops:
             output = sparse_flash_mla(
                 query, key_value, compressed_kv, topk_indices, self.sinks, self.scaling,
                 self.compress_ratio, self.sliding_window, query_offset, query_segments, raw_key_offset, main_key_offset,
