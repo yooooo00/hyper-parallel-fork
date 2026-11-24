@@ -27,7 +27,7 @@ from hyper_parallel.codegen.model_build_overlay import (
 )
 from hyper_parallel.codegen.session import CodegenBuildSession
 from hyper_parallel.codegen.emit.replacement import replacement_records_from_snapshot
-from hyper_parallel.components.modules import family as registry
+from hyper_parallel.components.modules import module_family as registry
 from hyper_parallel.distributed.mesh import DistributedSetup, LogicalDeviceMesh, MeshContext
 from hyper_parallel.distributed.plan import ShardingPlan
 from hyper_parallel.models import HyperAutoModelForCausalLM, module_build
