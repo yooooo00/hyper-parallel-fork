@@ -14,10 +14,29 @@
 # ============================================================================
 """Quantized module implementations (format-generic, model-agnostic)."""
 
-from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
-from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
+import importlib
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from hyper_parallel.components.modules.linear.linear import LowPrecisionLinear
+    from hyper_parallel.components.quantization.modules.grouped_experts import GroupedExperts
+
+_EXPORT_TO_MODULE = {
+    "GroupedExperts": "hyper_parallel.components.quantization.modules.grouped_experts",
+    "LowPrecisionLinear": "hyper_parallel.components.modules.linear.linear",
+}
 
 __all__ = [
     "GroupedExperts",
     "LowPrecisionLinear",
 ]
+
+
+def __getattr__(name: str) -> Any:  # pylint: disable=invalid-name
+    """Lazily resolve module exports to avoid cycles with ``hyper_parallel.models``."""
+    target = _EXPORT_TO_MODULE.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(importlib.import_module(target), name)
+    globals()[name] = value
+    return value

@@ -71,8 +71,8 @@ def build_linear_strategy(
         if in_features % MX_BLOCK_SIZE_32 or out_features % MX_BLOCK_SIZE_32:
             raise ValueError(
                 "MXFP8 Linear is not tile aligned: "
-                f"shape=({out_features}, {in_features}) requires multiples of "
-                f"{MX_BLOCK_SIZE_32}."
+                f"shape=({out_features}, {in_features}) requires dimensions divisible by "
+                f"{MX_BLOCK_SIZE_32} (multiples of {MX_BLOCK_SIZE_32})."
             )
         validate_npu_runtime()
         return MXFP8LinearStrategy()

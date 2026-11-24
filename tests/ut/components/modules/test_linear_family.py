@@ -21,10 +21,14 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
-from hyper_parallel.components.modules.linear import Linear
-from hyper_parallel.components.modules.low_precision_linear import replace_mxfp8_linear
+from hyper_parallel.components.modules.linear import (
+    Linear,
+    LowPrecisionLinear,
+    replace_hif8_linear,
+    replace_mxfp8_linear,
+)
+from hyper_parallel.components.quantization.functional.hifloat8_linear_func import HiFloat8LinearStrategy
 from hyper_parallel.components.quantization.functional.mxfp8_linear_func import MXFP8LinearStrategy
-from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
 from hyper_parallel.trainer.config.parallelism import entries_to_module_replacements
 from hyper_parallel.trainer.config.resolver import replace_override_path, resolve_config
 from tests.common.linear_family import linear_config
@@ -55,7 +59,7 @@ class TestLinearFamily(unittest.TestCase):
         expected.sum().backward()
         torch.testing.assert_close(model[0].weight.grad, reference.weight.grad, rtol=0, atol=0)
 
-    @patch("hyper_parallel.components.modules.low_precision_linear.validate_npu_runtime")
+    @patch("hyper_parallel.components.quantization.functional.linear_strategy_factory.validate_npu_runtime")
     def test_mxfp8_selected_without_global_enable_or_when(self, probe) -> None:
         """
         Feature: Scheme-selected Module Family.
@@ -76,6 +80,29 @@ class TestLinearFamily(unittest.TestCase):
             replace_mxfp8_linear(module=nn.Linear(30, 64), module_fqn="0", context={})
         with self.assertRaisesRegex(NotImplementedError, "pipeline parallelism"):
             replace_mxfp8_linear(module=nn.Linear(128, 256), module_fqn="0", context={"pp": True})
+
+    @patch("hyper_parallel.components.quantization.functional.linear_strategy_factory.validate_hifloat8_runtime")
+    def test_hif8_selected_without_tile_alignment(self, probe) -> None:
+        """
+        Feature: Unified Linear Module Family.
+        Description: An explicit hif8 scheme reuses the shared Dense strategy builder without MX block-32 alignment.
+        Expectation: Selection, non-aligned shapes, and parameter retention match the stated contract.
+        """
+        raw = linear_config(quantized=True).to_dict()
+        raw["training"]["low_precision"]["dtype_schemes"]["dense"] = {
+            "weight_format": "hif8",
+            "act_format": "hif8",
+        }
+        source = nn.Linear(17, 13).eval()
+        model = install_family(nn.Sequential(source), resolve_config(raw))
+        self.assertIs(type(model[0]), LowPrecisionLinear)
+        self.assertIs(type(model[0].strategy), HiFloat8LinearStrategy)
+        self.assertIs(model[0].weight, source.weight)
+        self.assertIs(model[0].bias, source.bias)
+        self.assertFalse(model[0].training)
+        probe.assert_called_once()
+        converted = replace_hif8_linear(module=nn.Linear(19, 11), module_fqn="0", context={})
+        self.assertIsInstance(converted.strategy, HiFloat8LinearStrategy)
 
     def test_dense_w4a8_is_not_silently_treated_as_grouped(self) -> None:
         """

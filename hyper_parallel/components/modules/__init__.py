@@ -44,7 +44,7 @@ if TYPE_CHECKING:
         GatedGroupedQueryAttention,
     )
     from hyper_parallel.components.modules.moe.grouped_experts.grouped_experts_family import GroupedExperts
-    from hyper_parallel.components.modules.linear import Linear
+    from hyper_parallel.components.modules.linear import Linear, LowPrecisionLinear
     from hyper_parallel.components.modules.mhc import MhcPostModule, MhcPreModule
     from hyper_parallel.components.modules.common.rms_norm import OffsetRMSNorm, RMSNorm
     from hyper_parallel.components.modules.moe.shared_expert import SharedExpert
@@ -88,6 +88,7 @@ _EXPORT_TO_MODULE = {
     "EngramModule": "engram",
     "GroupedExperts": "moe.grouped_experts.grouped_experts_family",
     "Linear": "linear",
+    "LowPrecisionLinear": "linear",
     "KimiDeltaAttention": "attention.kimi_delta_attention",
     "KimiDeltaAttentionModule": "attention.kimi_delta_attention",
     "GatedDeltaNet": "attention.gated_delta_net",
