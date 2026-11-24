@@ -23,8 +23,10 @@ import torch
 import yaml
 from torch import nn
 
-from hyper_parallel.components.modules.low_precision_grouped_experts import LowPrecisionGroupedExperts
-from hyper_parallel.components.modules.mxfp8_grouped_swiglu import FusedMXFP8GroupedSwiGLU
+from hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts import (
+    FusedMXFP8GroupedSwiGLU,
+    LowPrecisionGroupedExperts,
+)
 from hyper_parallel.components.quantization.functional.mxfp8_gmm_func import MXFP8GroupedLinear
 from hyper_parallel.components.quantization.functional.w4a8_gmm_func import W4A8GroupedLinear
 from hyper_parallel.components.quantization.functional.fake_w4a8_gmm_func import FakeW4A8GroupedLinear
@@ -38,6 +40,8 @@ from tests.common.qat_family import deepseek_experts_model, deepseek_qat_config,
 
 from tests.common.mark_utils import arg_mark
 
+_LOW_PRECISION = "hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts."
+
 
 class TestQATGroupedExperts(unittest.TestCase):
     """Mock device capability checks only; registration and strategy selection stay real."""
@@ -45,7 +49,7 @@ class TestQATGroupedExperts(unittest.TestCase):
     def setUp(self) -> None:
         """Isolate NPU availability without replacing the selected computation strategy."""
         for name in ("validate_npu_gmm_runtime", "validate_w4a8_gmm_runtime", "validate_fake_w4a8_gmm_runtime"):
-            probe = patch("hyper_parallel.components.modules.low_precision_grouped_experts." + name)
+            probe = patch(_LOW_PRECISION + name)
             probe.start()
             self.addCleanup(probe.stop)
 
@@ -71,7 +75,8 @@ class TestQATGroupedExperts(unittest.TestCase):
                 self.assertIs(model.mlp.experts.gate_up_proj, weight)
                 self.assertFalse(weight.requires_grad)
                 with patch(
-                    "hyper_parallel.components.modules.low_precision_grouped_experts._GroupedLinearFunction.apply",
+                    "hyper_parallel.components.modules.moe.grouped_experts."
+                    "low_precision_grouped_experts._GroupedLinearFunction.apply",
                     side_effect=lambda x, w, *_: x @ w[0].T,
                 ):
                     out = model.mlp.experts.forward_expert_major(
@@ -184,8 +189,8 @@ class TestQATGroupedExperts(unittest.TestCase):
                 module=bad_experts, strategy=MXFP8GroupedLinear(),
                 module_fqn="mlp.experts", context={"low_precision": policy})
 
-    @patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_swiglu_runtime")
-    @patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_gmm_runtime")
+    @patch(_LOW_PRECISION + "validate_npu_swiglu_runtime")
+    @patch(_LOW_PRECISION + "validate_npu_gmm_runtime")
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
     def test_fused_yaml_and_legacy_alias_overrides(self, gmm_probe, swiglu_probe) -> None:
@@ -210,7 +215,7 @@ class TestQATGroupedExperts(unittest.TestCase):
                         False, path="plan_overrides[0]")
                     model = install_family(TinyMoE(), resolve_config(config.to_dict()))
                     self.assertIs(type(model.mlp.experts.grouped_linear), MXFP8GroupedLinear)
-        self.assertEqual(gmm_probe.call_count, 2)
+        self.assertEqual(gmm_probe.call_count, 6)
         self.assertEqual(swiglu_probe.call_count, 2)
 
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
@@ -320,8 +325,8 @@ class TestQATGroupedExperts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "custom _apply_gate"):
             install_family(deepseek_experts_model(), resolve_config(raw))
 
-    @patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_swiglu_runtime")
-    @patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.validate_npu_gmm_runtime")
+    @patch(_LOW_PRECISION + "validate_npu_swiglu_runtime")
+    @patch(_LOW_PRECISION + "validate_npu_gmm_runtime")
     @arg_mark(plat_marks=["cpu_linux"], level_mark="level0",
               card_mark="onecard", essential_mark="essential")
     def test_deepseek_fusion_preserves_clamp_and_parameters(self, gmm_probe, fusion_probe) -> None:
@@ -343,8 +348,7 @@ class TestQATGroupedExperts(unittest.TestCase):
         torch.testing.assert_close(expert.gate_up_proj, gate_up.transpose(-2, -1))
         inputs = torch.randn(4, 128, dtype=torch.bfloat16)
         counts = torch.tensor([1, 0, 1, 2])
-        with patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu.fused_grouped_swiglu",
-                   return_value=inputs) as fused:
+        with patch(_LOW_PRECISION + "fused_grouped_swiglu", return_value=inputs) as fused:
             expert.forward_expert_major(inputs, counts)
         self.assertEqual(fused.call_args.kwargs, {"clamp_limit": source.limit})
         self.assertEqual(set(dict(expert.named_parameters())), {"gate_up_proj", "down_proj"})

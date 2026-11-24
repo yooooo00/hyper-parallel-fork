@@ -23,29 +23,16 @@ from typing import Any
 
 from torch import nn
 
+from hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts import (
+    QuantizedGroupedExperts,
+    replace_grouped_experts_with_policy,
+)
 from hyper_parallel.components.quantization.functional import build_low_precision_strategy
 from hyper_parallel.components.quantization.functional.linear_strategy_factory import (
     build_linear_strategy,
 )
-from hyper_parallel.components.quantization.modules.grouped_experts import (
-    GroupedExperts,
-)
 from hyper_parallel.components.quantization.modules.linear import LowPrecisionLinear
 from hyper_parallel.models.replacement import module_replacement
-
-
-def _check_ep1_only(context: Mapping[str, Any], factory_name: str) -> None:
-    """Reject any active model-parallel axis (EP=1 packed experts only)."""
-    active_model_parallel_axes = [
-        axis.upper()
-        for axis in ("tp", "cp", "ep", "pp")
-        if context.get(axis)
-    ]
-    if active_model_parallel_axes:
-        raise NotImplementedError(
-            f"{factory_name} currently require TP=CP=EP=PP=1; "
-            f"active axes: {active_model_parallel_axes}."
-        )
 
 
 @module_replacement
@@ -84,19 +71,15 @@ def replace_grouped_experts(
     module: nn.Module,
     module_fqn: str,
     context: Mapping[str, Any],
-) -> GroupedExperts:
+) -> QuantizedGroupedExperts:
     """Replace packed experts with the policy-selected grouped-linear strategy."""
 
-    _check_ep1_only(context, "Low-precision grouped experts")
-    parameters = tuple(module.parameters(recurse=False))
-    strategy = build_low_precision_strategy(
-        context.get("low_precision"),
-        tile_shapes=tuple(tuple(parameter.shape) for parameter in parameters),
-    )
-    return GroupedExperts.from_module(
-        module,
-        fqn=module_fqn,
-        grouped_linear=strategy,
+    return replace_grouped_experts_with_policy(
+        module=module,
+        module_fqn=module_fqn,
+        context=context,
+        scheme=context.get("low_precision"),
+        strategy_builder=build_low_precision_strategy,
     )
 
 
