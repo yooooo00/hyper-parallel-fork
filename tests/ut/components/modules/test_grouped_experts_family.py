@@ -20,8 +20,11 @@ from unittest.mock import patch
 
 import torch
 
-from hyper_parallel.components.modules.grouped_experts import GroupedExperts
-from hyper_parallel.components.modules.mxfp8_grouped_swiglu import MXFP8GroupedSwiGLU, FusedMXFP8GroupedSwiGLU
+from hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts import (
+    FusedMXFP8GroupedSwiGLU,
+    GroupedExperts,
+    MXFP8GroupedSwiGLU,
+)
 from hyper_parallel.trainer.config.resolver import ConfigResolutionError
 from tests.common.grouped_experts_family import TinyMoE, family_config, replace_experts
 
@@ -32,7 +35,10 @@ class TestGroupedExpertsFamily(unittest.TestCase):
     def setUp(self) -> None:
         """Isolate device availability without bypassing selection or constructors."""
         for name in ("validate_npu_gmm_runtime", "validate_npu_swiglu_runtime"):
-            device_check = patch("hyper_parallel.components.modules.mxfp8_grouped_swiglu." + name)
+            device_check = patch(
+                "hyper_parallel.components.modules.moe.grouped_experts."
+                "low_precision_grouped_experts." + name
+            )
             device_check.start()
             self.addCleanup(device_check.stop)
 

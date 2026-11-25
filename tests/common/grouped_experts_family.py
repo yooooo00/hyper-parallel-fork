@@ -179,7 +179,11 @@ def family_config(**selectors: Any) -> TrainerConfig:
                 "kind": "module",
                 "source_type": "tests.common.grouped_experts_family.PackedExperts",
                 "implementation": {
-                    "_target_": "hyper_parallel.components.modules.grouped_experts.GroupedExperts", **selectors,
+                    "_target_": (
+                        "hyper_parallel.components.modules.moe.grouped_experts."
+                        "low_precision_grouped_experts.GroupedExperts"
+                    ),
+                    **selectors,
                 },
             },
         }],

@@ -23,7 +23,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from hyper_parallel.components.modules.mxfp8_grouped_swiglu import (
+from hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts import (
     FusedMXFP8GroupedSwiGLU,
     MXFP8GroupedSwiGLU,
 )
@@ -36,7 +36,7 @@ from hyper_parallel.trainer.config.resolver import resolve_config
 from tests.common.grouped_experts_family import TinyMoE, family_config, replace_experts
 
 
-_LOCAL_MATH = "hyper_parallel.components.modules.mxfp8_grouped_swiglu."
+_LOCAL_MATH = "hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts."
 _RECIPES = (
     "hyper_parallel.models.qwen3_moe.adapter.distributed.expert_parallel.qwen3moe_ep_compute_fn",
     "hyper_parallel.distributed.expert_parallel.recipes.deepseekv3_ep_compute_fn",

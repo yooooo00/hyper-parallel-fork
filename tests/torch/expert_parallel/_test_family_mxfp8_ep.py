@@ -24,7 +24,9 @@ from torch.nn import functional as F
 
 from hyper_parallel.components.functional.moe_token_permute import moe_token_permute
 from hyper_parallel.components.functional.moe_token_unpermute import moe_token_unpermute
-from hyper_parallel.components.modules.mxfp8_grouped_swiglu import MXFP8GroupedSwiGLU
+from hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts import (
+    MXFP8GroupedSwiGLU,
+)
 from hyper_parallel.components.quantization.functional.mxfp8_fused_grouped_swiglu import fused_grouped_swiglu
 from hyper_parallel.components.quantization.functional.mxfp8_projection import mxfp8_projection
 from hyper_parallel.components.quantization.quantizers.mxfp8 import MXFP8Quantizer

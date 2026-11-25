@@ -22,7 +22,9 @@ from torch import _check
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from hyper_parallel.compile.tracer.graph_tracer import run_traced_graph, trace_model_graph
-from hyper_parallel.components.modules.grouped_experts import GroupedExperts
+from hyper_parallel.components.modules.moe.grouped_experts.low_precision_grouped_experts import (
+    GroupedExperts,
+)
 from hyper_parallel.components.functional.grouped_matmul import grouped_matmul
 from hyper_parallel.components.functional.npu_grouped_swiglu import _get_npu_grouped_matmul
 from hyper_parallel.distributed.expert_parallel.collectives import ep_split_sizes
